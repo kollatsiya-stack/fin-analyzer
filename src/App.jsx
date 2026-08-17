@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowRight,
@@ -129,6 +129,8 @@ export default function App() {
   const [showGsheetConfig, setShowGsheetConfig] = useState(false);
   const [gsheetBusy, setGsheetBusy] = useState(false);
   const [gsheetUrl, setGsheetUrl] = useState('');
+  const gsheetConfigRef = useRef(null);
+  const appOrigin = typeof window !== 'undefined' ? window.location.origin : '';
 
   const resultColumns = useMemo(() => columnsFromData(resultData), [resultData]);
   const mapValues = useMemo(
@@ -234,7 +236,12 @@ export default function App() {
     const clientId = gsheetClientId.trim();
     if (!clientId) {
       setShowGsheetConfig(true);
-      setErrorMsg('Укажите Google OAuth Client ID, чтобы сформировать Google Таблицу');
+      setErrorMsg('Укажите Google OAuth Client ID в разделе «Настройки Google Таблиц» ниже — там же инструкция, как его получить.');
+      if (typeof window !== 'undefined') {
+        window.setTimeout(() => {
+          gsheetConfigRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }, 50);
+      }
       return;
     }
     setGsheetBusy(true);
@@ -1156,15 +1163,32 @@ export default function App() {
                           <ExternalLink className="w-4 h-4" /> Открыть созданную Google Таблицу
                         </a>
                       )}
-                      <button type="button" onClick={() => setShowGsheetConfig((v) => !v)} className="text-xs text-slate-400 hover:text-slate-600 font-medium">
-                        {showGsheetConfig ? 'Скрыть настройки Google' : 'Настройки Google Таблиц'}
+                      <button type="button" onClick={() => setShowGsheetConfig((v) => !v)} className="inline-flex items-center gap-1.5 text-sm text-blue-700 hover:text-blue-800 font-bold">
+                        <Sliders className="w-4 h-4" /> {showGsheetConfig ? 'Скрыть настройки Google' : 'Настройки Google Таблиц (куда вставить Client ID)'}
                       </button>
                       {showGsheetConfig && (
-                        <div className="w-full max-w-xl bg-slate-50 border border-slate-200 rounded-xl p-4 text-left space-y-2">
-                          <label className="text-xs font-bold text-slate-600 block">Google OAuth Client ID</label>
-                          <input type="text" value={gsheetClientId} onChange={(e) => setGsheetClientId(e.target.value)} placeholder="xxxxxxxx.apps.googleusercontent.com" className="w-full border border-slate-300 rounded p-2 text-sm font-mono" />
+                        <div ref={gsheetConfigRef} className="w-full max-w-xl bg-blue-50 border-2 border-blue-200 rounded-xl p-4 text-left space-y-3 scroll-mt-24">
+                          <h4 className="font-black text-blue-900 text-sm">Как сформировать Google Таблицу</h4>
+                          <ol className="list-decimal list-inside text-xs text-slate-700 space-y-1.5 leading-relaxed">
+                            <li>Откройте <a className="text-blue-700 font-bold underline" href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener noreferrer">Google Cloud Console → Credentials</a> и создайте <b>OAuth client ID</b> с типом <b>Web application</b>.</li>
+                            <li>Включите <a className="text-blue-700 font-bold underline" href="https://console.cloud.google.com/apis/library/sheets.googleapis.com" target="_blank" rel="noopener noreferrer">Google Sheets API</a> для проекта.</li>
+                            <li>В поле <b>Authorized JavaScript origins</b> добавьте адрес этого приложения:
+                              <span className="font-mono bg-white border border-blue-200 rounded px-1.5 py-0.5 ml-1 inline-block">{appOrigin || 'адрес в адресной строке браузера'}</span>
+                            </li>
+                            <li>Скопируйте полученный <b>Client ID</b> (вида <span className="font-mono">…apps.googleusercontent.com</span>) и вставьте его в поле ниже.</li>
+                          </ol>
+                          <div>
+                            <label className="text-xs font-bold text-slate-600 block mb-1">Google OAuth Client ID</label>
+                            <input type="text" value={gsheetClientId} onChange={(e) => setGsheetClientId(e.target.value)} placeholder="xxxxxxxx.apps.googleusercontent.com" className="w-full border border-slate-300 rounded p-2 text-sm font-mono bg-white" />
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button type="button" onClick={handleCreateGoogleSheet} disabled={!gsheetClientId.trim() || gsheetBusy} className="bg-blue-600 text-white px-4 py-2 rounded-lg font-bold text-sm hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed">
+                              {gsheetBusy ? 'Формируем...' : 'Сохранить и сформировать'}
+                            </button>
+                            {gsheetClientId.trim() && <span className="text-xs text-green-700 font-bold inline-flex items-center gap-1"><Check className="w-3.5 h-3.5" /> Client ID сохранён в браузере</span>}
+                          </div>
                           <p className="text-xs text-slate-500 leading-relaxed">
-                            Создайте OAuth Client ID (тип «Web application») в Google Cloud Console и добавьте текущий адрес приложения в «Authorized JavaScript origins». Значение сохраняется локально в браузере. Область доступа: создание только тех файлов, которые создаёт приложение (<span className="font-mono">drive.file</span>).
+                            Значение хранится только в вашем браузере. Приложение запрашивает доступ лишь к файлам, которые само создаёт (область <span className="font-mono">drive.file</span>).
                           </p>
                         </div>
                       )}
