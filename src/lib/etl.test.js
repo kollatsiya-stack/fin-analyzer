@@ -105,6 +105,52 @@ describe('enrichment', () => {
     expect(result[0]['Округ (Источник 2)']).toBe('ЦФО');
   });
 
+  it('keeps unmatched rows without analytics by default', () => {
+    const result = applyEnrichment({
+      sourceData: [{ inn: '7701' }, { inn: '0000' }],
+      lookupData: [{ inn: '7701', manager: 'Ivanov' }],
+      config: {
+        mode: 'vlookup',
+        pullCols: ['manager'],
+        keys: [{ k1: 'inn', k2: 'inn', logic: 'AND', exact: true }],
+      },
+    });
+    expect(result).toHaveLength(2);
+    expect(result[0].manager).toBe('Ivanov');
+    expect(result[1].manager).toBe(null);
+  });
+
+  it('excludes unmatched rows when requested', () => {
+    const result = applyEnrichment({
+      sourceData: [{ inn: '7701' }, { inn: '0000' }],
+      lookupData: [{ inn: '7701', manager: 'Ivanov' }],
+      config: {
+        mode: 'vlookup',
+        pullCols: ['manager'],
+        unmatchedAction: 'exclude',
+        keys: [{ k1: 'inn', k2: 'inn', logic: 'AND', exact: true }],
+      },
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0].inn).toBe('7701');
+    expect(result[0].manager).toBe('Ivanov');
+  });
+
+  it('excludes unmatched rows on the synonym scan path too', () => {
+    const result = applyEnrichment({
+      sourceData: [{ city: 'Мск' }, { city: 'Казань' }],
+      lookupData: [{ town: 'г. Москва', region: 'ЦФО' }],
+      config: {
+        mode: 'vlookup',
+        pullCols: ['region'],
+        unmatchedAction: 'exclude',
+        keys: [{ k1: 'city', k2: 'town', logic: 'AND', exact: false, synonyms: [{ a: 'Мск', b: 'г. Москва' }] }],
+      },
+    });
+    expect(result).toHaveLength(1);
+    expect(result[0].region).toBe('ЦФО');
+  });
+
   it('matches when EITHER criterion holds using OR logic', () => {
     const result = applyEnrichment({
       sourceData: [{ inn: 'X', phone: '+7 999' }],

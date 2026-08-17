@@ -76,6 +76,7 @@ export default function App() {
     { id: 1, k1: '', k2: '', logic: 'AND', exact: true, synonyms: [] },
   ]);
   const [enrichPullCols, setEnrichPullCols] = useState([{ id: 1, col: '' }]);
+  const [enrichUnmatched, setEnrichUnmatched] = useState('keep');
   const [enrichRuleInput, setEnrichRuleInput] = useState({ col: '', op: 'содержит', val: '', tag: '' });
   const [enrichRules, setEnrichRules] = useState([]);
   const [enrichRulesSource, setEnrichRulesSource] = useState(createEmptySource);
@@ -356,6 +357,7 @@ export default function App() {
           mode: enrichMode,
           targetCol: enrichTargetCol,
           pullCols: enrichPullCols.map((p) => p.col).filter(Boolean),
+          unmatchedAction: enrichUnmatched,
           keys: enrichKeys,
           rules: enrichRules,
         };
@@ -642,6 +644,21 @@ export default function App() {
                                     </div>
                                   ))}
                                   <button type="button" onClick={() => setEnrichPullCols((prev) => [...prev, { id: Date.now(), col: '' }])} className="text-sm font-bold text-indigo-600">+ Добавить колонку</button>
+                                </div>
+                                <div className="bg-white p-4 rounded-lg border shadow-sm">
+                                  <h4 className="font-bold text-slate-800 text-sm mb-1">Строки без совпадения по критериям:</h4>
+                                  <p className="text-xs text-slate-400 font-medium mb-2">Что делать со строками Источника 1, для которых не нашлось соответствия.</p>
+                                  <div className="flex flex-col sm:flex-row gap-3">
+                                    {[
+                                      ['keep', 'Оставить без новой аналитики'],
+                                      ['exclude', 'Исключить из результата'],
+                                    ].map(([value, label]) => (
+                                      <label key={value} className={`flex items-center gap-2 p-3 rounded-lg border cursor-pointer flex-1 transition ${enrichUnmatched === value ? 'border-indigo-500 bg-indigo-50' : 'border-slate-200 bg-white hover:border-indigo-300'}`}>
+                                        <input type="radio" name="enrich-unmatched" className="accent-indigo-600" checked={enrichUnmatched === value} onChange={() => setEnrichUnmatched(value)} />
+                                        <span className="font-bold text-sm text-slate-800">{label}</span>
+                                      </label>
+                                    ))}
+                                  </div>
                                 </div>
                               </>
                             )}

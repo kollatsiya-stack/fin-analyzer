@@ -44,7 +44,7 @@ function pairMatches(r1, r2, criteria) {
 }
 
 export function applyEnrichment({ sourceData, lookupData, config }) {
-  const { mode, targetCol, sourceCol, pullCols, keys, rules } = config;
+  const { mode, targetCol, sourceCol, pullCols, keys, rules, unmatchedAction } = config;
 
   if (mode === 'vlookup') {
     if (!lookupData?.length) throw new Error('Загрузите источник для объединения (Источник 2)');
@@ -73,11 +73,16 @@ export function applyEnrichment({ sourceData, lookupData, config }) {
       return out;
     };
 
+    // What to do with source-1 rows that have no match in source 2:
+    // 'exclude' drops them, otherwise they are kept without the new analytics.
+    const excludeUnmatched = unmatchedAction === 'exclude';
+
     const criteria = buildCriteria(validKeys);
     // Fast O(n+m) path when every criterion is an exact AND-match: an index by
     // composite key covers it. OR-logic or synonym dictionaries need a scan.
     const allExactAnd = criteria.every((c, i) => c.exact && (i === 0 || c.logic === 'AND'));
 
+    let matchOf;
     if (allExactAnd) {
       const k2Fields = criteria.map((c) => c.k2);
       const k1Fields = criteria.map((c) => c.k1);
@@ -86,10 +91,18 @@ export function applyEnrichment({ sourceData, lookupData, config }) {
         const key = compositeKey(row, k2Fields);
         if (!index.has(key)) index.set(key, row);
       }
-      return sourceData.map((r1) => assign(r1, index.get(compositeKey(r1, k1Fields))));
+      matchOf = (r1) => index.get(compositeKey(r1, k1Fields));
+    } else {
+      matchOf = (r1) => lookupData.find((r2) => pairMatches(r1, r2, criteria));
     }
 
-    return sourceData.map((r1) => assign(r1, lookupData.find((r2) => pairMatches(r1, r2, criteria))));
+    const result = [];
+    for (const r1 of sourceData) {
+      const match = matchOf(r1);
+      if (!match && excludeUnmatched) continue;
+      result.push(assign(r1, match));
+    }
+    return result;
   }
 
   if (!targetCol) throw new Error('Укажите имя новой колонки');
