@@ -1,0 +1,17 @@
+{
+  "name": "fin-analyzer",
+  "install": "npm ci",
+  "terminals": [
+    {
+      "name": "dev",
+      "command": "npm run dev -- --host",
+      "description": "Vite dev server for the Turbohub ETL app (http://localhost:5173)."
+    }
+  ],
+  "ports": [
+    {
+      "name": "dev",
+      "port": 5173
+    }
+  ]
+}
