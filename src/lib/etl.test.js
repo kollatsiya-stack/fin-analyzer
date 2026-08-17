@@ -296,6 +296,43 @@ describe('allocation', () => {
     expect(result.map((r) => r.name)).toEqual(['Ann', 'Bob', 'Cyd']);
   });
 
+  it('carries only the selected columns from source 2', () => {
+    const result = applyAllocation({
+      sourceData: [{ dept: 'IT', Сумма: 100 }],
+      driverData: [
+        { dept: 'IT', hours: 1, name: 'Ann', secret: 'X' },
+        { dept: 'IT', hours: 1, name: 'Bob', secret: 'Y' },
+      ],
+      config: {
+        keys: [{ k1: 'dept', k2: 'dept' }],
+        sumCol: 'Сумма',
+        driverCol: 'hours',
+        carryCols: ['name'],
+      },
+    });
+    expect(result).toHaveLength(2);
+    expect(result[0].name).toBe('Ann');
+    expect(result[0].secret).toBeUndefined();
+    expect('secret' in result[1]).toBe(false);
+  });
+
+  it('omits the formula column when addFormula is false', () => {
+    const result = applyAllocation({
+      sourceData: [{ dept: 'IT', Сумма: 100 }, { dept: 'HR', Сумма: 50 }],
+      driverData: [{ dept: 'IT', hours: 1, name: 'Ann' }],
+      config: {
+        keys: [{ k1: 'dept', k2: 'dept' }],
+        sumCol: 'Сумма',
+        driverCol: 'hours',
+        carryCols: ['name'],
+        addFormula: false,
+      },
+    });
+    expect(result.every((r) => !('_Формула_Расчета' in r))).toBe(true);
+    // The unmatched HR row is still passed through.
+    expect(result.find((r) => r.dept === 'HR')).toBeTruthy();
+  });
+
   it('does not overwrite colliding source columns', () => {
     const result = applyAllocation({
       sourceData: [{ dept: 'IT', Сумма: 10, name: 'Head' }],

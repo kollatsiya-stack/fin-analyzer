@@ -121,11 +121,19 @@ export function applyEnrichment({ sourceData, lookupData, config }) {
 }
 
 export function applyAllocation({ sourceData, driverData, config }) {
-  const { keys, sumCol, driverCol } = config;
+  const { keys, sumCol, driverCol, carryCols, addFormula = true } = config;
   if (!driverData?.length) throw new Error('Загрузите базу распределения (Источник 2)');
   if (!sumCol || !driverCol) throw new Error('Укажите колонку суммы и драйвера');
   const validKeys = (keys || []).filter((k) => k.k1 && k.k2);
   if (!validKeys.length) throw new Error('Задайте хотя бы один критерий связи');
+
+  const FORMULA_COL = '_Формула_Расчета';
+  // When carryCols is undefined we keep the legacy behavior of copying every
+  // column from the driver row. When it is provided, only carry the selected
+  // columns (an empty list carries nothing but the recomputed sum).
+  const carryAll = carryCols === undefined;
+  const carry = carryAll ? null : (carryCols || []).filter(Boolean);
+  const withStatus = (row, status) => (addFormula ? { ...row, [FORMULA_COL]: status } : { ...row });
 
   const k2Fields = validKeys.map((k) => k.k2);
   const k1Fields = validKeys.map((k) => k.k1);
@@ -140,14 +148,14 @@ export function applyAllocation({ sourceData, driverData, config }) {
   for (const r1 of sourceData) {
     const matches = buckets.get(compositeKey(r1, k1Fields)) || [];
     if (!matches.length) {
-      finalData.push({ ...r1, _Формула_Расчета: 'База не найдена' });
+      finalData.push(withStatus(r1, 'База не найдена'));
       continue;
     }
 
     const origSum = parseNumeric(r1[sumCol]);
     const totalDriver = matches.reduce((s, m) => s + parseNumeric(m[driverCol]), 0);
     if (totalDriver === 0) {
-      finalData.push({ ...r1, _Формула_Расчета: 'Сумма драйверов равна 0' });
+      finalData.push(withStatus(r1, 'Сумма драйверов равна 0'));
       continue;
     }
 
@@ -159,13 +167,15 @@ export function applyAllocation({ sourceData, driverData, config }) {
       allocatedTotal = roundMoney(allocatedTotal + fraction);
 
       const merged = { ...r1 };
-      Object.entries(m).forEach(([k, v]) => {
+      const carryFields = carryAll ? Object.keys(m) : carry;
+      carryFields.forEach((k) => {
         if (k === sumCol) return;
+        const v = m[k];
         if (k in merged && String(merged[k]) !== String(v)) merged[`${k}_база`] = v;
         else merged[k] = v;
       });
       merged[sumCol] = fraction;
-      merged._Формула_Расчета = `${origSum} × (${driver} ÷ ${totalDriver}) = ${fraction}`;
+      if (addFormula) merged[FORMULA_COL] = `${origSum} × (${driver} ÷ ${totalDriver}) = ${fraction}`;
       finalData.push(merged);
     });
   }

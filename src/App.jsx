@@ -90,6 +90,8 @@ export default function App() {
   const [allocKeys, setAllocKeys] = useState([{ id: 1, k1: '', k2: '' }]);
   const [allocSumCol, setAllocSumCol] = useState('');
   const [allocDriverCol, setAllocDriverCol] = useState('');
+  const [allocCarryCols, setAllocCarryCols] = useState([{ id: 1, col: '' }]);
+  const [allocAddFormula, setAllocAddFormula] = useState(true);
 
   const [mapSourceCol, setMapSourceCol] = useState('');
   const [mapRules, setMapRules] = useState([{ id: 1, src: '', target: '' }]);
@@ -369,7 +371,13 @@ export default function App() {
           rules: enrichRules,
         };
       } else if (activeRule === 2) {
-        config = { keys: allocKeys, sumCol: allocSumCol, driverCol: allocDriverCol };
+        config = {
+          keys: allocKeys,
+          sumCol: allocSumCol,
+          driverCol: allocDriverCol,
+          carryCols: allocCarryCols.map((p) => p.col).filter(Boolean),
+          addFormula: allocAddFormula,
+        };
       } else if (activeRule === 3) {
         config = { sourceCol: mapSourceCol, rules: mapRules };
       } else if (activeRule === 4) {
@@ -784,6 +792,31 @@ export default function App() {
                                 </select>
                               </div>
                             </div>
+                            <div className="bg-white p-4 rounded-lg border shadow-sm space-y-2">
+                              <h4 className="font-bold text-slate-800 text-sm mb-1">Какие колонки из Источника 2 перенести в результат?</h4>
+                              <p className="text-xs text-slate-400 font-medium mb-1">Выберите колонки базы распределения, которые нужно добавить к разбитым строкам. Если колонка уже есть в Источнике 1, значение из базы попадёт в колонку «…_база».</p>
+                              {allocCarryCols.map((p, i) => (
+                                <div key={p.id} className="flex gap-2 items-center">
+                                  <select value={p.col} onChange={(e) => setAllocCarryCols((prev) => prev.map((x) => x.id === p.id ? { ...x, col: e.target.value } : x))} className="flex-1 border-slate-300 rounded p-2 font-bold text-purple-800 bg-purple-50">
+                                    <option value="">Выберите колонку из Источника 2...</option>
+                                    {source2.columns.map((c) => <option key={c} value={c}>{c}</option>)}
+                                  </select>
+                                  {i > 0 && (
+                                    <button type="button" onClick={() => setAllocCarryCols((prev) => prev.filter((x) => x.id !== p.id))} className="text-slate-400 hover:text-red-500 p-2">
+                                      <Trash2 className="w-4 h-4" />
+                                    </button>
+                                  )}
+                                </div>
+                              ))}
+                              <button type="button" onClick={() => setAllocCarryCols((prev) => [...prev, { id: Date.now(), col: '' }])} className="text-sm font-bold text-indigo-600">+ Добавить колонку</button>
+                            </div>
+                            <label className="flex items-center gap-3 bg-white p-4 rounded-lg border shadow-sm cursor-pointer">
+                              <input type="checkbox" checked={allocAddFormula} onChange={(e) => setAllocAddFormula(e.target.checked)} className="accent-indigo-600 w-4 h-4" />
+                              <span>
+                                <span className="font-bold text-slate-800 text-sm block">Добавить колонку с формулой распределения</span>
+                                <span className="text-xs text-slate-400 font-medium">Колонка «_Формула_Расчета» покажет, как рассчитана каждая доля (и пометит строки без совпадения).</span>
+                              </span>
+                            </label>
                             <div className="bg-slate-800 p-4 rounded-xl text-white space-y-2">
                               <h4 className="font-bold text-sm text-slate-300">Формула расчета</h4>
                               <div className="bg-slate-900 p-3 rounded-lg border border-slate-700 font-mono text-xs md:text-sm text-green-400 text-center">
