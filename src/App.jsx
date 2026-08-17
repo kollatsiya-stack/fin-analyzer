@@ -5,12 +5,14 @@ import {
   Calculator,
   CalendarClock,
   Check,
+  ExternalLink,
   Filter,
   RefreshCcw,
   Save,
   Scissors,
   Search,
   Sliders,
+  Table,
   Trash2,
   TrendingUp,
   Upload,
@@ -27,6 +29,7 @@ import {
   readFileAsWorkbook,
 } from './lib/excel.js';
 import { rulesFromRows, runRule } from './lib/etl.js';
+import { exportToGoogleSheet } from './lib/gsheets.js';
 
 const createEmptySource = () => ({
   file: null,
@@ -115,6 +118,17 @@ export default function App() {
   const [revalSumCol, setRevalSumCol] = useState('');
   const [revalRate, setRevalRate] = useState('1.2');
 
+  const [gsheetClientId, setGsheetClientId] = useState(() => {
+    if (typeof localStorage !== 'undefined') {
+      const saved = localStorage.getItem('gsheet_client_id');
+      if (saved) return saved;
+    }
+    return import.meta.env?.VITE_GOOGLE_CLIENT_ID || '';
+  });
+  const [showGsheetConfig, setShowGsheetConfig] = useState(false);
+  const [gsheetBusy, setGsheetBusy] = useState(false);
+  const [gsheetUrl, setGsheetUrl] = useState('');
+
   const resultColumns = useMemo(() => columnsFromData(resultData), [resultData]);
   const mapValues = useMemo(
     () => (mapSourceCol ? uniqueSorted(source1.data.map((r) => r[mapSourceCol])) : []),
@@ -201,6 +215,46 @@ export default function App() {
     setEnrichRules((prev) => [...prev, ...imported]);
     setSuccessMsg(`Импортировано правил из файла: ${imported.length}`);
     setErrorMsg('');
+  };
+
+  useEffect(() => {
+    if (typeof localStorage === 'undefined') return;
+    if (gsheetClientId) localStorage.setItem('gsheet_client_id', gsheetClientId);
+    else localStorage.removeItem('gsheet_client_id');
+  }, [gsheetClientId]);
+
+  const handleCreateGoogleSheet = async () => {
+    setErrorMsg('');
+    setGsheetUrl('');
+    if (!resultData.length) {
+      setErrorMsg('Нет данных для экспорта');
+      return;
+    }
+    const clientId = gsheetClientId.trim();
+    if (!clientId) {
+      setShowGsheetConfig(true);
+      setErrorMsg('Укажите Google OAuth Client ID, чтобы сформировать Google Таблицу');
+      return;
+    }
+    setGsheetBusy(true);
+    try {
+      const title = `Turbohub ETL — ${new Date().toLocaleString('ru-RU')}`;
+      const { spreadsheetUrl } = await exportToGoogleSheet({
+        clientId,
+        title,
+        data: resultData,
+        columns: resultColumns,
+      });
+      setGsheetUrl(spreadsheetUrl);
+      setSuccessMsg('Google Таблица успешно сформирована');
+      if (spreadsheetUrl && typeof window !== 'undefined') {
+        window.open(spreadsheetUrl, '_blank', 'noopener');
+      }
+    } catch (err) {
+      setErrorMsg(err.message || String(err));
+    } finally {
+      setGsheetBusy(false);
+    }
   };
 
   useEffect(() => {
@@ -1065,15 +1119,39 @@ export default function App() {
                     <p className="text-slate-500 font-medium mb-8">
                       Система сгенерировала <span className="font-bold text-slate-800">{resultData.length}</span> строк по заданным правилам.
                     </p>
-                    <button type="button" onClick={() => {
-                      try {
-                        exportToExcel(resultData);
-                      } catch (err) {
-                        setErrorMsg(err.message);
-                      }
-                    }} className="bg-green-600 text-white px-10 py-4 rounded-xl font-black text-lg hover:bg-green-700 transition shadow-lg shadow-green-200 inline-flex items-center gap-3">
-                      <Save className="w-6 h-6" /> Скачать итоговый Excel
-                    </button>
+                    <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
+                      <button type="button" onClick={() => {
+                        try {
+                          exportToExcel(resultData);
+                        } catch (err) {
+                          setErrorMsg(err.message);
+                        }
+                      }} className="bg-green-600 text-white px-10 py-4 rounded-xl font-black text-lg hover:bg-green-700 transition shadow-lg shadow-green-200 inline-flex items-center gap-3 w-full sm:w-auto justify-center">
+                        <Save className="w-6 h-6" /> Скачать итоговый Excel
+                      </button>
+                      <button type="button" onClick={handleCreateGoogleSheet} disabled={gsheetBusy} className="bg-blue-600 text-white px-10 py-4 rounded-xl font-black text-lg hover:bg-blue-700 transition shadow-lg shadow-blue-200 inline-flex items-center gap-3 w-full sm:w-auto justify-center disabled:opacity-60 disabled:cursor-not-allowed">
+                        <Table className="w-6 h-6" /> {gsheetBusy ? 'Формируем...' : 'Сформировать Google Таблицу'}
+                      </button>
+                    </div>
+                    <div className="mt-4 flex flex-col items-center gap-2">
+                      {gsheetUrl && (
+                        <a href={gsheetUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-2 text-blue-700 font-bold hover:underline">
+                          <ExternalLink className="w-4 h-4" /> Открыть созданную Google Таблицу
+                        </a>
+                      )}
+                      <button type="button" onClick={() => setShowGsheetConfig((v) => !v)} className="text-xs text-slate-400 hover:text-slate-600 font-medium">
+                        {showGsheetConfig ? 'Скрыть настройки Google' : 'Настройки Google Таблиц'}
+                      </button>
+                      {showGsheetConfig && (
+                        <div className="w-full max-w-xl bg-slate-50 border border-slate-200 rounded-xl p-4 text-left space-y-2">
+                          <label className="text-xs font-bold text-slate-600 block">Google OAuth Client ID</label>
+                          <input type="text" value={gsheetClientId} onChange={(e) => setGsheetClientId(e.target.value)} placeholder="xxxxxxxx.apps.googleusercontent.com" className="w-full border border-slate-300 rounded p-2 text-sm font-mono" />
+                          <p className="text-xs text-slate-500 leading-relaxed">
+                            Создайте OAuth Client ID (тип «Web application») в Google Cloud Console и добавьте текущий адрес приложения в «Authorized JavaScript origins». Значение сохраняется локально в браузере. Область доступа: создание только тех файлов, которые создаёт приложение (<span className="font-mono">drive.file</span>).
+                          </p>
+                        </div>
+                      )}
+                    </div>
                   </div>
                   <DataPreview data={resultData} columns={resultColumns} maxRows={50} />
                   <div className="text-center">

@@ -12,6 +12,7 @@ import {
   rulesFromRows,
 } from './etl.js';
 import { pairsFromRows } from './excel.js';
+import { buildSpreadsheetBody, resultToValues } from './gsheets.js';
 
 describe('parseNumeric', () => {
   it('parses US and EU formats', () => {
@@ -182,6 +183,34 @@ describe('rulesFromRows', () => {
     ]);
     expect(rules).toHaveLength(1);
     expect(rules[0]).toMatchObject({ col: 'col', op: 'не равно', val: 'x', tag: 'Tag' });
+  });
+});
+
+describe('google sheets export', () => {
+  it('builds a header row followed by data rows, filling missing cells', () => {
+    const values = resultToValues(
+      [
+        { Город: 'Мск', Сумма: 100 },
+        { Город: 'СПб' },
+      ],
+      ['Город', 'Сумма']
+    );
+    expect(values).toEqual([
+      ['Город', 'Сумма'],
+      ['Мск', 100],
+      ['СПб', ''],
+    ]);
+  });
+
+  it('encodes numbers and strings into typed Sheets API cells', () => {
+    const body = buildSpreadsheetBody('T', [
+      ['Город', 'Сумма'],
+      ['Мск', 100],
+    ]);
+    const rowData = body.sheets[0].data[0].rowData;
+    expect(body.properties.title).toBe('T');
+    expect(rowData[0].values[0].userEnteredValue).toEqual({ stringValue: 'Город' });
+    expect(rowData[1].values[1].userEnteredValue).toEqual({ numberValue: 100 });
   });
 });
 
