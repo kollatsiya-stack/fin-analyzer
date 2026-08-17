@@ -43,66 +43,130 @@ function pairMatches(r1, r2, criteria) {
   }, false);
 }
 
+/**
+ * Объединение основной базы со справочником с обработкой коллизий 1-ко-многим.
+ *
+ * Возвращает `{ data, conflicts }`. Если по одному набору критериев в справочнике
+ * находится несколько строк с РАЗНЫМИ значениями подтягиваемой колонки, это
+ * фиксируется как конфликт: в `conflicts` попадает список кандидатов, а в ячейку
+ * записывается либо выбранное пользователем значение (`resolutions`), либо первое.
+ */
+export function mergeSources({
+  sourceData,
+  lookupData,
+  keys,
+  pullCols,
+  sourceCol,
+  targetCol,
+  unmatchedAction,
+  resolutions = {},
+}) {
+  if (!lookupData?.length) throw new Error('Загрузите источник для объединения (Источник 2)');
+  const validKeys = (keys || []).filter((k) => k.k1 && k.k2);
+  if (!validKeys.length) throw new Error('Задайте критерии связи');
+
+  const cleanPulls = (pullCols || []).filter(Boolean);
+  const legacy = !cleanPulls.length && sourceCol;
+  const pulls = legacy ? [sourceCol] : cleanPulls;
+  if (!pulls.length) {
+    throw new Error('Выберите хотя бы одну колонку для добавления из Источника 2');
+  }
+
+  const existingCols = new Set(sourceData.length ? Object.keys(sourceData[0]) : []);
+  const outNames = pulls.map((col) => {
+    if (legacy && targetCol) return targetCol;
+    return existingCols.has(col) ? `${col} (Источник 2)` : col;
+  });
+
+  const excludeUnmatched = unmatchedAction === 'exclude';
+  const criteria = buildCriteria(validKeys);
+  const keyFields = criteria.map((c) => c.k1);
+
+  // Для каждой строки основной базы собираем ВСЕ совпадения (а не только первое),
+  // чтобы уметь распознавать неоднозначные соответствия.
+  const allExactAnd = criteria.every((c, i) => c.exact && (i === 0 || c.logic === 'AND'));
+  let matchesOf;
+  if (allExactAnd) {
+    const k2Fields = criteria.map((c) => c.k2);
+    const k1Fields = criteria.map((c) => c.k1);
+    const index = new Map();
+    for (const row of lookupData) {
+      const key = compositeKey(row, k2Fields);
+      if (!index.has(key)) index.set(key, []);
+      index.get(key).push(row);
+    }
+    matchesOf = (r1) => index.get(compositeKey(r1, k1Fields)) || [];
+  } else {
+    matchesOf = (r1) => lookupData.filter((r2) => pairMatches(r1, r2, criteria));
+  }
+
+  const conflictsMap = new Map();
+  const data = [];
+  for (const r1 of sourceData) {
+    const matches = matchesOf(r1);
+    if (!matches.length) {
+      if (excludeUnmatched) continue;
+      const out = { ...r1 };
+      outNames.forEach((n) => {
+        out[n] = null;
+      });
+      data.push(out);
+      continue;
+    }
+
+    const out = { ...r1 };
+    const keyLabel = keyFields.map((f) => r1[f]).join(' | ');
+    const keySig = keyFields.map((f) => norm(r1[f])).join('|||');
+    pulls.forEach((col, i) => {
+      const outName = outNames[i];
+      const distinct = [];
+      const seen = new Set();
+      for (const m of matches) {
+        const value = m[col];
+        const nv = norm(value);
+        if (nv === '') continue;
+        if (!seen.has(nv)) {
+          seen.add(nv);
+          distinct.push(value);
+        }
+      }
+      if (distinct.length <= 1) {
+        out[outName] = distinct.length ? distinct[0] : matches[0][col] ?? null;
+        return;
+      }
+      // Конфликт: несколько разных значений под один набор ключей.
+      const conflictId = `${keySig}<<>>${outName}`;
+      if (!conflictsMap.has(conflictId)) {
+        conflictsMap.set(conflictId, {
+          id: conflictId,
+          label: keyLabel,
+          col: outName,
+          values: distinct.map((v) => (v === null || v === undefined ? '' : String(v))),
+        });
+      }
+      const chosen = resolutions[conflictId];
+      out[outName] = chosen !== undefined && chosen !== null ? chosen : distinct[0];
+    });
+    data.push(out);
+  }
+
+  return { data, conflicts: Array.from(conflictsMap.values()) };
+}
+
 export function applyEnrichment({ sourceData, lookupData, config }) {
-  const { mode, targetCol, sourceCol, pullCols, keys, rules, unmatchedAction } = config;
+  const { mode, targetCol, sourceCol, pullCols, keys, rules, unmatchedAction, resolutions } = config;
 
   if (mode === 'vlookup') {
-    if (!lookupData?.length) throw new Error('Загрузите источник для объединения (Источник 2)');
-    const validKeys = (keys || []).filter((k) => k.k1 && k.k2);
-    if (!validKeys.length) throw new Error('Задайте критерии связи');
-
-    // Columns to bring in from source 2. Support the new multi-column list and
-    // the legacy single sourceCol/targetCol pair.
-    const cleanPulls = (pullCols || []).filter(Boolean);
-    const legacy = !cleanPulls.length && sourceCol;
-    const pulls = legacy ? [sourceCol] : cleanPulls;
-    if (!pulls.length) {
-      throw new Error('Выберите хотя бы одну колонку для добавления из Источника 2');
-    }
-
-    const existingCols = new Set(sourceData.length ? Object.keys(sourceData[0]) : []);
-    const outNames = pulls.map((col) => {
-      if (legacy && targetCol) return targetCol;
-      return existingCols.has(col) ? `${col} (Источник 2)` : col;
-    });
-    const assign = (r1, match) => {
-      const out = { ...r1 };
-      pulls.forEach((col, i) => {
-        out[outNames[i]] = match ? match[col] : null;
-      });
-      return out;
-    };
-
-    // What to do with source-1 rows that have no match in source 2:
-    // 'exclude' drops them, otherwise they are kept without the new analytics.
-    const excludeUnmatched = unmatchedAction === 'exclude';
-
-    const criteria = buildCriteria(validKeys);
-    // Fast O(n+m) path when every criterion is an exact AND-match: an index by
-    // composite key covers it. OR-logic or synonym dictionaries need a scan.
-    const allExactAnd = criteria.every((c, i) => c.exact && (i === 0 || c.logic === 'AND'));
-
-    let matchOf;
-    if (allExactAnd) {
-      const k2Fields = criteria.map((c) => c.k2);
-      const k1Fields = criteria.map((c) => c.k1);
-      const index = new Map();
-      for (const row of lookupData) {
-        const key = compositeKey(row, k2Fields);
-        if (!index.has(key)) index.set(key, row);
-      }
-      matchOf = (r1) => index.get(compositeKey(r1, k1Fields));
-    } else {
-      matchOf = (r1) => lookupData.find((r2) => pairMatches(r1, r2, criteria));
-    }
-
-    const result = [];
-    for (const r1 of sourceData) {
-      const match = matchOf(r1);
-      if (!match && excludeUnmatched) continue;
-      result.push(assign(r1, match));
-    }
-    return result;
+    return mergeSources({
+      sourceData,
+      lookupData,
+      keys,
+      pullCols,
+      sourceCol,
+      targetCol,
+      unmatchedAction,
+      resolutions,
+    }).data;
   }
 
   if (!targetCol) throw new Error('Укажите имя новой колонки');
@@ -121,7 +185,7 @@ export function applyEnrichment({ sourceData, lookupData, config }) {
 }
 
 export function applyAllocation({ sourceData, driverData, config }) {
-  const { keys, sumCol, driverCol, carryCols, addFormula = true } = config;
+  const { keys, sumCol, driverCol, carryCols, addFormula = true, aggregateSource = false } = config;
   if (!driverData?.length) throw new Error('Загрузите базу распределения (Источник 2)');
   if (!sumCol || !driverCol) throw new Error('Укажите колонку суммы и драйвера');
   const validKeys = (keys || []).filter((k) => k.k1 && k.k2);
@@ -137,6 +201,28 @@ export function applyAllocation({ sourceData, driverData, config }) {
 
   const k2Fields = validKeys.map((k) => k.k2);
   const k1Fields = validKeys.map((k) => k.k1);
+
+  // «Сбор данных по критериям»: агрегируем строки Источника 1 с одинаковыми
+  // значениями ключей в одну строку (сумма складывается), затем распределяем.
+  let workingSource = sourceData;
+  if (aggregateSource) {
+    const groups = new Map();
+    for (const row of sourceData) {
+      const key = compositeKey(row, k1Fields);
+      if (!groups.has(key)) {
+        const seed = {};
+        k1Fields.forEach((f) => {
+          seed[f] = row[f];
+        });
+        seed[sumCol] = 0;
+        groups.set(key, seed);
+      }
+      const bucket = groups.get(key);
+      bucket[sumCol] = roundMoney(parseNumeric(bucket[sumCol]) + parseNumeric(row[sumCol]));
+    }
+    workingSource = Array.from(groups.values());
+  }
+
   const buckets = new Map();
   for (const row of driverData) {
     const key = compositeKey(row, k2Fields);
@@ -145,7 +231,7 @@ export function applyAllocation({ sourceData, driverData, config }) {
   }
 
   const finalData = [];
-  for (const r1 of sourceData) {
+  for (const r1 of workingSource) {
     const matches = buckets.get(compositeKey(r1, k1Fields)) || [];
     if (!matches.length) {
       finalData.push(withStatus(r1, 'База не найдена'));

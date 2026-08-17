@@ -9,6 +9,7 @@ import {
   applyMapping,
   applyPostings,
   applyRevaluation,
+  mergeSources,
   rulesFromRows,
 } from './etl.js';
 import { pairsFromRows, readArrayBuffer } from './excel.js';
@@ -280,7 +281,98 @@ describe('pairsFromRows', () => {
   });
 });
 
+describe('mergeSources conflicts (1-to-many)', () => {
+  const lookupConflict = [
+    { org: 'Ромашка', manager: 'Мария' },
+    { org: 'Ромашка', manager: 'Фаина' },
+  ];
+
+  it('reports a conflict and defaults to the first value', () => {
+    const { data, conflicts } = mergeSources({
+      sourceData: [{ org: 'Ромашка' }],
+      lookupData: lookupConflict,
+      keys: [{ k1: 'org', k2: 'org', exact: true }],
+      pullCols: ['manager'],
+    });
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0].values).toEqual(['Мария', 'Фаина']);
+    expect(conflicts[0].col).toBe('manager');
+    expect(data[0].manager).toBe('Мария');
+  });
+
+  it('applies a chosen resolution value', () => {
+    const first = mergeSources({
+      sourceData: [{ org: 'Ромашка' }],
+      lookupData: lookupConflict,
+      keys: [{ k1: 'org', k2: 'org', exact: true }],
+      pullCols: ['manager'],
+    });
+    const conflictId = first.conflicts[0].id;
+    const resolved = mergeSources({
+      sourceData: [{ org: 'Ромашка' }],
+      lookupData: lookupConflict,
+      keys: [{ k1: 'org', k2: 'org', exact: true }],
+      pullCols: ['manager'],
+      resolutions: { [conflictId]: 'Фаина' },
+    });
+    expect(resolved.data[0].manager).toBe('Фаина');
+    expect(resolved.conflicts).toHaveLength(1);
+  });
+
+  it('does not flag a conflict when repeated matches agree', () => {
+    const { data, conflicts } = mergeSources({
+      sourceData: [{ org: 'Ромашка' }],
+      lookupData: [
+        { org: 'Ромашка', manager: 'Мария' },
+        { org: 'Ромашка', manager: 'Мария' },
+      ],
+      keys: [{ k1: 'org', k2: 'org', exact: true }],
+      pullCols: ['manager'],
+    });
+    expect(conflicts).toHaveLength(0);
+    expect(data[0].manager).toBe('Мария');
+  });
+
+  it('resolves conflicts through a synonym criterion (differently-written keys)', () => {
+    const { data, conflicts } = mergeSources({
+      sourceData: [{ org: 'ООО Ромашка' }],
+      lookupData: [
+        { org: 'Ромашка ООО', manager: 'Мария' },
+        { org: 'Ромашка ООО', manager: 'Фаина' },
+      ],
+      keys: [{ k1: 'org', k2: 'org', exact: false, synonyms: [{ a: 'ООО Ромашка', b: 'Ромашка ООО' }] }],
+      pullCols: ['manager'],
+    });
+    expect(conflicts).toHaveLength(1);
+    expect(data[0].manager).toBe('Мария');
+  });
+});
+
 describe('allocation', () => {
+  it('aggregates source-1 rows by criteria before distributing', () => {
+    const result = applyAllocation({
+      sourceData: [
+        { dept: 'IT', Сумма: 60 },
+        { dept: 'IT', Сумма: 40 },
+      ],
+      driverData: [
+        { dept: 'IT', hours: 1, name: 'Ann' },
+        { dept: 'IT', hours: 1, name: 'Bob' },
+      ],
+      config: {
+        keys: [{ k1: 'dept', k2: 'dept' }],
+        sumCol: 'Сумма',
+        driverCol: 'hours',
+        carryCols: ['name'],
+        aggregateSource: true,
+      },
+    });
+    // 60 + 40 = 100, поровну между Ann и Bob.
+    expect(result).toHaveLength(2);
+    expect(result.reduce((s, r) => s + r.Сумма, 0)).toBeCloseTo(100);
+    expect(result.map((r) => r.Сумма).sort()).toEqual([50, 50]);
+  });
+
   it('splits amount by driver and keeps remainder on the last row', () => {
     const result = applyAllocation({
       sourceData: [{ dept: 'IT', Сумма: 100 }],

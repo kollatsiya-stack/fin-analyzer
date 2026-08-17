@@ -28,7 +28,7 @@ import {
   parseMappingFile,
   readFileAsWorkbook,
 } from './lib/excel.js';
-import { rulesFromRows, runRule } from './lib/etl.js';
+import { mergeSources, rulesFromRows, runRule } from './lib/etl.js';
 import { exportToGoogleSheet } from './lib/gsheets.js';
 
 const createEmptySource = () => ({
@@ -77,6 +77,9 @@ export default function App() {
   ]);
   const [enrichPullCols, setEnrichPullCols] = useState([{ id: 1, col: '' }]);
   const [enrichUnmatched, setEnrichUnmatched] = useState('keep');
+  const [enrichConflicts, setEnrichConflicts] = useState([]);
+  const [enrichResolutions, setEnrichResolutions] = useState({});
+  const [enrichMergeSnapshot, setEnrichMergeSnapshot] = useState(null);
   const [enrichRuleInput, setEnrichRuleInput] = useState({ col: '', op: 'содержит', val: '', tag: '' });
   const [enrichRules, setEnrichRules] = useState([]);
   const [enrichRulesSource, setEnrichRulesSource] = useState(createEmptySource);
@@ -92,6 +95,7 @@ export default function App() {
   const [allocDriverCol, setAllocDriverCol] = useState('');
   const [allocCarryCols, setAllocCarryCols] = useState([{ id: 1, col: '' }]);
   const [allocAddFormula, setAllocAddFormula] = useState(true);
+  const [allocAggregate, setAllocAggregate] = useState(false);
 
   const [mapSourceCol, setMapSourceCol] = useState('');
   const [mapRules, setMapRules] = useState([{ id: 1, src: '', target: '' }]);
@@ -377,6 +381,7 @@ export default function App() {
           driverCol: allocDriverCol,
           carryCols: allocCarryCols.map((p) => p.col).filter(Boolean),
           addFormula: allocAddFormula,
+          aggregateSource: allocAggregate,
         };
       } else if (activeRule === 3) {
         config = { sourceCol: mapSourceCol, rules: mapRules };
@@ -399,13 +404,32 @@ export default function App() {
         config = { sumCol: revalSumCol, rate: revalRate };
       }
 
-      const finalData = runRule(activeRule, {
-        source1: source1.data,
-        source2: source2.data,
-        columns: source1.columns,
-        opsData: opsSource.data,
-        config,
-      });
+      let finalData;
+      if (activeRule === 1 && enrichMode === 'vlookup') {
+        // Объединение баз: считаем через mergeSources, чтобы получить конфликты
+        // (несколько разных значений под один набор критериев).
+        const snapshot = {
+          sourceData: source1.data,
+          lookupData: source2.data,
+          keys: enrichKeys,
+          pullCols: enrichPullCols.map((p) => p.col).filter(Boolean),
+          unmatchedAction: enrichUnmatched,
+        };
+        const merged = mergeSources({ ...snapshot, resolutions: {} });
+        finalData = merged.data;
+        setEnrichMergeSnapshot(snapshot);
+        setEnrichResolutions({});
+        setEnrichConflicts(merged.conflicts);
+      } else {
+        finalData = runRule(activeRule, {
+          source1: source1.data,
+          source2: source2.data,
+          columns: source1.columns,
+          opsData: opsSource.data,
+          config,
+        });
+        setEnrichConflicts([]);
+      }
 
       setResultData(finalData);
       if (chainEnabled && activeRule !== 7) {
@@ -422,6 +446,19 @@ export default function App() {
       }
       setStep(3);
       setSuccessMsg(`Успешно обработано строк: ${finalData.length}`);
+    } catch (err) {
+      setErrorMsg(err.message || String(err));
+    }
+  };
+
+  const resolveEnrichConflict = (conflictId, value) => {
+    if (!enrichMergeSnapshot) return;
+    const next = { ...enrichResolutions, [conflictId]: value };
+    try {
+      const merged = mergeSources({ ...enrichMergeSnapshot, resolutions: next });
+      setEnrichResolutions(next);
+      setEnrichConflicts(merged.conflicts);
+      setResultData(merged.data);
     } catch (err) {
       setErrorMsg(err.message || String(err));
     }
@@ -811,6 +848,13 @@ export default function App() {
                               <button type="button" onClick={() => setAllocCarryCols((prev) => [...prev, { id: Date.now(), col: '' }])} className="text-sm font-bold text-indigo-600">+ Добавить колонку</button>
                             </div>
                             <label className="flex items-center gap-3 bg-white p-4 rounded-lg border shadow-sm cursor-pointer">
+                              <input type="checkbox" checked={allocAggregate} onChange={(e) => setAllocAggregate(e.target.checked)} className="accent-indigo-600 w-4 h-4" />
+                              <span>
+                                <span className="font-bold text-slate-800 text-sm block">Сначала собрать суммы Источника 1 по критериям связи</span>
+                                <span className="text-xs text-slate-400 font-medium">Строки Источника 1 с одинаковыми значениями критериев объединяются (суммы складываются), затем общий итог распределяется по критериям Источника 2.</span>
+                              </span>
+                            </label>
+                            <label className="flex items-center gap-3 bg-white p-4 rounded-lg border shadow-sm cursor-pointer">
                               <input type="checkbox" checked={allocAddFormula} onChange={(e) => setAllocAddFormula(e.target.checked)} className="accent-indigo-600 w-4 h-4" />
                               <span>
                                 <span className="font-bold text-slate-800 text-sm block">Добавить колонку с формулой распределения</span>
@@ -1176,6 +1220,28 @@ export default function App() {
                     <p className="text-slate-500 font-medium mb-8">
                       Система сгенерировала <span className="font-bold text-slate-800">{resultData.length}</span> строк по заданным правилам.
                     </p>
+                    {enrichConflicts.length > 0 && (
+                      <div className="max-w-3xl mx-auto text-left bg-amber-50 border-2 border-amber-200 rounded-xl p-4 mb-8">
+                        <h3 className="font-black text-amber-900 text-sm mb-1 flex items-center gap-2">
+                          <AlertCircle className="w-4 h-4" /> Неоднозначные соответствия ({enrichConflicts.length})
+                        </h3>
+                        <p className="text-xs text-amber-800/80 font-medium mb-3">
+                          По этим критериям в Источнике 2 найдено несколько разных значений. Выберите верное — итоговая таблица обновится сразу.
+                        </p>
+                        <div className="space-y-2 max-h-72 overflow-y-auto">
+                          {enrichConflicts.map((c) => (
+                            <div key={c.id} className="bg-white border border-amber-200 rounded-lg p-3 flex flex-col sm:flex-row sm:items-center gap-2">
+                              <div className="flex-1 text-sm text-slate-700">
+                                <span className="font-bold">[{c.label}]</span> → колонка <span className="font-bold">«{c.col}»</span>
+                              </div>
+                              <select value={enrichResolutions[c.id] ?? c.values[0]} onChange={(e) => resolveEnrichConflict(c.id, e.target.value)} className="border border-slate-300 rounded p-2 text-sm bg-white font-bold text-indigo-700 sm:w-64">
+                                {c.values.map((v) => <option key={v} value={v}>{v}</option>)}
+                              </select>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                     <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
                       <button type="button" onClick={() => {
                         try {
