@@ -39,6 +39,17 @@ export function parseWorkbook(workbook) {
 }
 
 export function readArrayBuffer(buffer) {
+  const bytes = new Uint8Array(buffer);
+  // XLSX is a ZIP ("PK"), legacy XLS is an OLE compound file. Anything else is
+  // treated as text (CSV/TSV) and decoded as UTF-8 — SheetJS otherwise guesses
+  // Windows-1252 for a BOM-less CSV and mangles Cyrillic.
+  const isZip = bytes[0] === 0x50 && bytes[1] === 0x4b;
+  const isOle = bytes[0] === 0xd0 && bytes[1] === 0xcf;
+  if (!isZip && !isOle) {
+    let text = new TextDecoder('utf-8').decode(bytes);
+    if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+    return parseWorkbook(XLSX.read(text, { type: 'string' }));
+  }
   return parseWorkbook(XLSX.read(buffer, { type: 'array' }));
 }
 
@@ -135,6 +146,24 @@ export function parseMappingFile(buffer) {
     src: String(r[c1] || ''),
     target: String(r[c2] || ''),
   }));
+}
+
+/**
+ * Read a two-column correspondence file into synonym pairs. The first column is
+ * treated as the value in source 1, the second as the equivalent in source 2.
+ */
+export function pairsFromRows(rows) {
+  if (!rows?.length) return [];
+  const keys = Object.keys(rows[0]);
+  if (keys.length < 2) return [];
+  const c1 = keys.find((k) => /исходн|источник\s*1|source\s*1|слева|left/i.test(k)) || keys[0];
+  const c2 =
+    keys.find((k) => /эталон|соответ|источник\s*2|source\s*2|справа|right/i.test(k)) ||
+    keys.find((k) => k !== c1) ||
+    keys[1];
+  return rows
+    .map((r) => ({ a: String(r[c1] ?? '').trim(), b: String(r[c2] ?? '').trim() }))
+    .filter((p) => p.a && p.b);
 }
 
 export { columnsFromData };

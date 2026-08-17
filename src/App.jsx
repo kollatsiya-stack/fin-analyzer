@@ -1,16 +1,18 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowRight,
   Calculator,
   CalendarClock,
   Check,
+  ExternalLink,
   Filter,
   RefreshCcw,
   Save,
   Scissors,
   Search,
   Sliders,
+  Table,
   Trash2,
   TrendingUp,
   Upload,
@@ -19,8 +21,15 @@ import {
 import FileSource, { LoadedBadge } from './components/FileSource.jsx';
 import DataPreview from './components/DataPreview.jsx';
 import { columnsFromData, uniqueSorted } from './lib/parse.js';
-import { exportToExcel, loadFromLink, parseMappingFile, readFileAsWorkbook } from './lib/excel.js';
-import { runRule } from './lib/etl.js';
+import {
+  exportToExcel,
+  loadFromLink,
+  pairsFromRows,
+  parseMappingFile,
+  readFileAsWorkbook,
+} from './lib/excel.js';
+import { mergeSources, rulesFromRows, runRule } from './lib/etl.js';
+import { exportToGoogleSheet } from './lib/gsheets.js';
 
 const createEmptySource = () => ({
   file: null,
@@ -36,7 +45,7 @@ const createEmptySource = () => ({
 });
 
 const RULES = [
-  { id: 1, name: 'Обогащение данных', desc: 'Добавление аналитик, VLOOKUP, тегирование', icon: Search, color: 'text-blue-600', bg: 'bg-blue-100', border: 'hover:border-blue-300' },
+  { id: 1, name: 'Обогащение/объединение данных', desc: 'Добавление аналитик, объединение баз, тегирование', icon: Search, color: 'text-blue-600', bg: 'bg-blue-100', border: 'hover:border-blue-300' },
   { id: 2, name: 'Сплитование', desc: 'Аллокация сумм по драйверам и базам', icon: Scissors, color: 'text-orange-600', bg: 'bg-orange-100', border: 'hover:border-orange-300' },
   { id: 3, name: 'Мэппинг', desc: 'Переклассификация и замена значений', icon: RefreshCcw, color: 'text-emerald-600', bg: 'bg-emerald-100', border: 'hover:border-emerald-300' },
   { id: 4, name: 'Элиминация', desc: 'Фильтрация, черные списки, ВГО', icon: Filter, color: 'text-red-600', bg: 'bg-red-100', border: 'hover:border-red-300' },
@@ -63,14 +72,30 @@ export default function App() {
 
   const [enrichMode, setEnrichMode] = useState('rules');
   const [enrichTargetCol, setEnrichTargetCol] = useState('');
-  const [enrichKeys, setEnrichKeys] = useState([{ id: 1, k1: '', k2: '' }]);
-  const [enrichSourceCol, setEnrichSourceCol] = useState('');
+  const [enrichKeys, setEnrichKeys] = useState([
+    { id: 1, k1: '', k2: '', logic: 'AND', exact: true, synonyms: [] },
+  ]);
+  const [enrichPullCols, setEnrichPullCols] = useState([{ id: 1, col: '' }]);
+  const [enrichUnmatched, setEnrichUnmatched] = useState('keep');
+  const [enrichConflicts, setEnrichConflicts] = useState([]);
+  const [enrichResolutions, setEnrichResolutions] = useState({});
+  const [enrichMergeSnapshot, setEnrichMergeSnapshot] = useState(null);
   const [enrichRuleInput, setEnrichRuleInput] = useState({ col: '', op: 'содержит', val: '', tag: '' });
   const [enrichRules, setEnrichRules] = useState([]);
+  const [enrichRulesSource, setEnrichRulesSource] = useState(createEmptySource);
+
+  const [synModalKeyId, setSynModalKeyId] = useState(null);
+  const [synInputA, setSynInputA] = useState('');
+  const [synInputB, setSynInputB] = useState('');
+  const [synSearchA, setSynSearchA] = useState('');
+  const [synSearchB, setSynSearchB] = useState('');
 
   const [allocKeys, setAllocKeys] = useState([{ id: 1, k1: '', k2: '' }]);
   const [allocSumCol, setAllocSumCol] = useState('');
   const [allocDriverCol, setAllocDriverCol] = useState('');
+  const [allocCarryCols, setAllocCarryCols] = useState([{ id: 1, col: '' }]);
+  const [allocAddFormula, setAllocAddFormula] = useState(true);
+  const [allocAggregate, setAllocAggregate] = useState(false);
 
   const [mapSourceCol, setMapSourceCol] = useState('');
   const [mapRules, setMapRules] = useState([{ id: 1, src: '', target: '' }]);
@@ -100,6 +125,19 @@ export default function App() {
   const [revalSumCol, setRevalSumCol] = useState('');
   const [revalRate, setRevalRate] = useState('1.2');
 
+  const [gsheetClientId, setGsheetClientId] = useState(() => {
+    if (typeof localStorage !== 'undefined') {
+      const saved = localStorage.getItem('gsheet_client_id');
+      if (saved) return saved;
+    }
+    return import.meta.env?.VITE_GOOGLE_CLIENT_ID || '';
+  });
+  const [showGsheetConfig, setShowGsheetConfig] = useState(false);
+  const [gsheetBusy, setGsheetBusy] = useState(false);
+  const [gsheetUrl, setGsheetUrl] = useState('');
+  const gsheetConfigRef = useRef(null);
+  const appOrigin = typeof window !== 'undefined' ? window.location.origin : '';
+
   const resultColumns = useMemo(() => columnsFromData(resultData), [resultData]);
   const mapValues = useMemo(
     () => (mapSourceCol ? uniqueSorted(source1.data.map((r) => r[mapSourceCol])) : []),
@@ -113,6 +151,125 @@ export default function App() {
     () => (coaAccCol ? uniqueSorted(coaSource.data.map((r) => r[coaAccCol])) : []),
     [coaAccCol, coaSource.data]
   );
+
+  const updateEnrichKey = (id, patch) =>
+    setEnrichKeys((prev) => prev.map((k) => (k.id === id ? { ...k, ...patch } : k)));
+
+  const synKey = enrichKeys.find((k) => k.id === synModalKeyId) || null;
+  const synValuesA = useMemo(
+    () => (synKey?.k1 ? uniqueSorted(source1.data.map((r) => r[synKey.k1])) : []),
+    [synKey?.k1, source1.data]
+  );
+  const synValuesB = useMemo(
+    () => (synKey?.k2 ? uniqueSorted(source2.data.map((r) => r[synKey.k2])) : []),
+    [synKey?.k2, source2.data]
+  );
+
+  const openSynModal = (id) => {
+    setSynInputA('');
+    setSynInputB('');
+    setSynSearchA('');
+    setSynSearchB('');
+    setSynModalKeyId(id);
+  };
+
+  const addSynonym = () => {
+    if (!synKey || !synInputA || !synInputB) return;
+    const exists = (synKey.synonyms || []).some((p) => p.a === synInputA && p.b === synInputB);
+    if (!exists) {
+      updateEnrichKey(synKey.id, { synonyms: [...(synKey.synonyms || []), { a: synInputA, b: synInputB }] });
+    }
+    setSynInputA('');
+    setSynInputB('');
+  };
+
+  const removeSynonym = (idx) => {
+    if (!synKey) return;
+    updateEnrichKey(synKey.id, { synonyms: (synKey.synonyms || []).filter((_, i) => i !== idx) });
+  };
+
+  const loadSynonymFile = async (file) => {
+    if (!file || !synKey) return;
+    try {
+      const parsed = await readFileAsWorkbook(file);
+      const pairs = pairsFromRows(parsed.data);
+      if (!pairs.length) {
+        setErrorMsg('В файле соответствий не найдено пар (нужны минимум две колонки: значение 1 → значение 2)');
+        return;
+      }
+      const existing = new Set((synKey.synonyms || []).map((p) => `${p.a}|||${p.b}`));
+      const merged = [...(synKey.synonyms || [])];
+      for (const p of pairs) {
+        const sig = `${p.a}|||${p.b}`;
+        if (!existing.has(sig)) {
+          existing.add(sig);
+          merged.push(p);
+        }
+      }
+      updateEnrichKey(synKey.id, { synonyms: merged });
+      setErrorMsg('');
+    } catch (err) {
+      setErrorMsg('Ошибка загрузки файла соответствий: ' + err.message);
+    }
+  };
+
+  const importEnrichRules = () => {
+    const imported = rulesFromRows(enrichRulesSource.data);
+    if (!imported.length) {
+      setErrorMsg(
+        'В файле не найдено корректных правил. Нужны колонки: «Колонка», «Условие», «Значение», «Тег».'
+      );
+      return;
+    }
+    setEnrichRules((prev) => [...prev, ...imported]);
+    setSuccessMsg(`Импортировано правил из файла: ${imported.length}`);
+    setErrorMsg('');
+  };
+
+  useEffect(() => {
+    if (typeof localStorage === 'undefined') return;
+    if (gsheetClientId) localStorage.setItem('gsheet_client_id', gsheetClientId);
+    else localStorage.removeItem('gsheet_client_id');
+  }, [gsheetClientId]);
+
+  const handleCreateGoogleSheet = async () => {
+    setErrorMsg('');
+    setGsheetUrl('');
+    if (!resultData.length) {
+      setErrorMsg('Нет данных для экспорта');
+      return;
+    }
+    const clientId = gsheetClientId.trim();
+    if (!clientId) {
+      setShowGsheetConfig(true);
+      setErrorMsg('Укажите Google OAuth Client ID в разделе «Настройки Google Таблиц» ниже — там же инструкция, как его получить.');
+      if (typeof window !== 'undefined') {
+        window.setTimeout(() => {
+          gsheetConfigRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }, 50);
+      }
+      return;
+    }
+    setGsheetBusy(true);
+    try {
+      const title = `Turbohub ETL — ${new Date().toLocaleString('ru-RU')}`;
+      const { spreadsheetUrl } = await exportToGoogleSheet({
+        clientId,
+        title,
+        data: resultData,
+        columns: resultColumns,
+      });
+      setGsheetUrl(spreadsheetUrl);
+      setSuccessMsg('Google Таблица успешно сформирована');
+      if (spreadsheetUrl && typeof window !== 'undefined') {
+        window.open(spreadsheetUrl, '_blank', 'noopener');
+      }
+    } catch (err) {
+      setErrorMsg(err.message || String(err));
+    } finally {
+      setGsheetBusy(false);
+    }
+  };
 
   useEffect(() => {
     if (!opsCol || !opsSource.isLoaded || !opsSource.data.length) return;
@@ -212,12 +369,20 @@ export default function App() {
         config = {
           mode: enrichMode,
           targetCol: enrichTargetCol,
-          sourceCol: enrichSourceCol,
+          pullCols: enrichPullCols.map((p) => p.col).filter(Boolean),
+          unmatchedAction: enrichUnmatched,
           keys: enrichKeys,
           rules: enrichRules,
         };
       } else if (activeRule === 2) {
-        config = { keys: allocKeys, sumCol: allocSumCol, driverCol: allocDriverCol };
+        config = {
+          keys: allocKeys,
+          sumCol: allocSumCol,
+          driverCol: allocDriverCol,
+          carryCols: allocCarryCols.map((p) => p.col).filter(Boolean),
+          addFormula: allocAddFormula,
+          aggregateSource: allocAggregate,
+        };
       } else if (activeRule === 3) {
         config = { sourceCol: mapSourceCol, rules: mapRules };
       } else if (activeRule === 4) {
@@ -239,13 +404,32 @@ export default function App() {
         config = { sumCol: revalSumCol, rate: revalRate };
       }
 
-      const finalData = runRule(activeRule, {
-        source1: source1.data,
-        source2: source2.data,
-        columns: source1.columns,
-        opsData: opsSource.data,
-        config,
-      });
+      let finalData;
+      if (activeRule === 1 && enrichMode === 'vlookup') {
+        // Объединение баз: считаем через mergeSources, чтобы получить конфликты
+        // (несколько разных значений под один набор критериев).
+        const snapshot = {
+          sourceData: source1.data,
+          lookupData: source2.data,
+          keys: enrichKeys,
+          pullCols: enrichPullCols.map((p) => p.col).filter(Boolean),
+          unmatchedAction: enrichUnmatched,
+        };
+        const merged = mergeSources({ ...snapshot, resolutions: {} });
+        finalData = merged.data;
+        setEnrichMergeSnapshot(snapshot);
+        setEnrichResolutions({});
+        setEnrichConflicts(merged.conflicts);
+      } else {
+        finalData = runRule(activeRule, {
+          source1: source1.data,
+          source2: source2.data,
+          columns: source1.columns,
+          opsData: opsSource.data,
+          config,
+        });
+        setEnrichConflicts([]);
+      }
 
       setResultData(finalData);
       if (chainEnabled && activeRule !== 7) {
@@ -262,6 +446,19 @@ export default function App() {
       }
       setStep(3);
       setSuccessMsg(`Успешно обработано строк: ${finalData.length}`);
+    } catch (err) {
+      setErrorMsg(err.message || String(err));
+    }
+  };
+
+  const resolveEnrichConflict = (conflictId, value) => {
+    if (!enrichMergeSnapshot) return;
+    const next = { ...enrichResolutions, [conflictId]: value };
+    try {
+      const merged = mergeSources({ ...enrichMergeSnapshot, resolutions: next });
+      setEnrichResolutions(next);
+      setEnrichConflicts(merged.conflicts);
+      setResultData(merged.data);
     } catch (err) {
       setErrorMsg(err.message || String(err));
     }
@@ -393,11 +590,11 @@ export default function App() {
                   <div className="flex-grow overflow-x-auto">
                     {activeRule === 1 && (
                       <div className="space-y-6">
-                        <h3 className="text-xl font-black flex items-center gap-2 text-slate-800"><Search className="text-indigo-500" /> Обогащение данных</h3>
+                        <h3 className="text-xl font-black flex items-center gap-2 text-slate-800"><Search className="text-indigo-500" /> Обогащение/объединение данных</h3>
                         <div className="flex flex-col sm:flex-row gap-4 mb-4">
                           {[
                             ['rules', 'Условная логика (каскад правил)'],
-                            ['vlookup', 'Сопоставление баз (справочник)'],
+                            ['vlookup', 'Сопоставление баз (объединение)'],
                           ].map(([value, label]) => (
                             <label key={value} className={`flex items-center gap-2 p-3 rounded-lg border cursor-pointer flex-1 transition ${enrichMode === value ? 'border-indigo-500 bg-indigo-50' : 'border-slate-200 bg-white hover:border-indigo-300'}`}>
                               <input type="radio" className="hidden" checked={enrichMode === value} onChange={() => setEnrichMode(value)} />
@@ -405,53 +602,142 @@ export default function App() {
                             </label>
                           ))}
                         </div>
-                        <div className="bg-indigo-50 border border-indigo-200 p-4 rounded-xl">
-                          <h4 className="font-bold text-indigo-900 text-sm mb-2">Имя новой колонки (результат):</h4>
-                          <input type="text" value={enrichTargetCol} onChange={(e) => setEnrichTargetCol(e.target.value)} placeholder="Например: Проект, Категория..." className="w-full border-indigo-300 rounded p-2 font-bold text-indigo-700 bg-white shadow-sm" />
-                        </div>
                         {enrichMode === 'vlookup' ? (
                           <div className="space-y-4">
-                            <FileSource compact source={source2} title="Загрузите справочник (Источник 2)" onFile={(file) => processFile(file, setSource2)} onLink={(kind, value) => {
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                              <div className="bg-slate-50 border border-slate-200 p-4 rounded-xl">
+                                <h4 className="font-bold text-slate-800 text-sm mb-1">Основной источник (Источник 1)</h4>
+                                {source1.isLoaded ? (
+                                  <p className="text-xs font-bold text-green-700">Загружен: {source1.data.length} строк · {source1.columns.length} колонок</p>
+                                ) : (
+                                  <p className="text-xs font-bold text-red-600">Загрузите основную базу на шаге 1</p>
+                                )}
+                              </div>
+                              <div className="bg-slate-50 border border-slate-200 p-4 rounded-xl">
+                                <h4 className="font-bold text-slate-800 text-sm mb-1">Источник для объединения (Источник 2)</h4>
+                                {source2.isLoaded ? (
+                                  <p className="text-xs font-bold text-green-700">Загружен: {source2.data.length} строк · {source2.columns.length} колонок</p>
+                                ) : (
+                                  <p className="text-xs text-slate-500 font-medium">Загрузите файл или ссылку ниже</p>
+                                )}
+                              </div>
+                            </div>
+                            <FileSource compact source={source2} title="Загрузите источник для объединения (Источник 2)" onFile={(file) => processFile(file, setSource2)} onLink={(kind, value) => {
                               if (kind === 'link') setSource2((prev) => ({ ...prev, link: value }));
                               else handleLoadLink(source2, setSource2);
                             }} />
                             <LoadedBadge source={source2} onSheetChange={(name) => handleSheetChange(name, setSource2)} />
                             {source2.isLoaded && (
                               <>
-                                <div>
-                                  <h4 className="font-bold text-slate-800 text-sm mb-3">Условия связи</h4>
+                                <div className="bg-white border border-slate-200 p-5 rounded-xl shadow-sm space-y-3">
+                                  <div className="flex items-center justify-between flex-wrap gap-2">
+                                    <h4 className="font-bold text-slate-800 text-sm">Критерии связывания баз</h4>
+                                    <span className="text-xs text-slate-400 font-medium">Колонка А (Источник 1) ↔ Колонка Б (Источник 2)</span>
+                                  </div>
                                   {enrichKeys.map((k, i) => (
-                                    <div key={k.id} className="flex gap-2 items-center mb-2">
-                                      <select value={k.k1} onChange={(e) => setEnrichKeys((prev) => prev.map((x) => x.id === k.id ? { ...x, k1: e.target.value } : x))} className="flex-1 border-slate-300 rounded p-2 text-sm bg-white font-medium">
-                                        <option value="">Ключ из основной базы...</option>
-                                        {source1.columns.map((c) => <option key={c} value={c}>{c}</option>)}
-                                      </select>
-                                      <span className="text-slate-400 font-bold">=</span>
-                                      <select value={k.k2} onChange={(e) => setEnrichKeys((prev) => prev.map((x) => x.id === k.id ? { ...x, k2: e.target.value } : x))} className="flex-1 border-slate-300 rounded p-2 text-sm bg-white font-medium">
-                                        <option value="">Ключ из справочника...</option>
+                                    <div key={k.id} className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-3">
+                                      <div className="flex flex-col md:flex-row gap-2 md:items-center">
+                                        {i > 0 ? (
+                                          <select value={k.logic} onChange={(e) => updateEnrichKey(k.id, { logic: e.target.value })} className="w-full md:w-20 border-slate-300 rounded p-2 text-sm bg-white font-bold text-indigo-600">
+                                            <option value="AND">И</option>
+                                            <option value="OR">ИЛИ</option>
+                                          </select>
+                                        ) : (
+                                          <span className="w-full md:w-20 text-xs font-bold text-slate-400 md:text-center">Критерий 1</span>
+                                        )}
+                                        <select value={k.k1} onChange={(e) => updateEnrichKey(k.id, { k1: e.target.value })} className="flex-1 border-slate-300 rounded p-2 text-sm bg-white font-medium">
+                                          <option value="">Колонка из Источника 1...</option>
+                                          {source1.columns.map((c) => <option key={c} value={c}>{c}</option>)}
+                                        </select>
+                                        <span className="text-slate-400 font-bold text-center px-1">↔</span>
+                                        <select value={k.k2} onChange={(e) => updateEnrichKey(k.id, { k2: e.target.value })} className="flex-1 border-slate-300 rounded p-2 text-sm bg-white font-medium">
+                                          <option value="">Колонка из Источника 2...</option>
+                                          {source2.columns.map((c) => <option key={c} value={c}>{c}</option>)}
+                                        </select>
+                                        {i > 0 && (
+                                          <button type="button" onClick={() => setEnrichKeys((prev) => prev.filter((x) => x.id !== k.id))} className="text-slate-400 hover:text-red-500 p-2 self-center">
+                                            <Trash2 className="w-4 h-4" />
+                                          </button>
+                                        )}
+                                      </div>
+                                      <div className="flex flex-wrap items-center gap-3 md:pl-[88px]">
+                                        <label className="flex items-center gap-2 text-sm font-medium text-slate-700 cursor-pointer">
+                                          <input type="checkbox" checked={k.exact !== false} onChange={(e) => {
+                                            const nextExact = e.target.checked;
+                                            updateEnrichKey(k.id, { exact: nextExact });
+                                            if (!nextExact && k.k1 && k.k2) openSynModal(k.id);
+                                          }} />
+                                          Значения в базах полностью совпадают
+                                        </label>
+                                        {k.exact === false && (
+                                          <button type="button" disabled={!k.k1 || !k.k2} onClick={() => openSynModal(k.id)} className="text-sm font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 disabled:opacity-40 disabled:cursor-not-allowed px-3 py-1.5 rounded-lg flex items-center gap-1">
+                                            <Sliders className="w-4 h-4" /> Настроить соответствия ({(k.synonyms || []).length})
+                                          </button>
+                                        )}
+                                      </div>
+                                    </div>
+                                  ))}
+                                  <button type="button" onClick={() => setEnrichKeys((prev) => [...prev, { id: Date.now(), k1: '', k2: '', logic: 'AND', exact: true, synonyms: [] }])} className="text-sm font-bold text-indigo-600">+ Добавить критерий</button>
+                                </div>
+                                <div className="bg-white p-4 rounded-lg border shadow-sm space-y-2">
+                                  <h4 className="font-bold text-slate-800 text-sm mb-1">Что подтягиваем из Источника 2? (колонки)</h4>
+                                  <p className="text-xs text-slate-400 font-medium mb-1">Добавьте одну или несколько колонок — каждая станет новой колонкой в результате.</p>
+                                  {enrichPullCols.map((p, i) => (
+                                    <div key={p.id} className="flex gap-2 items-center">
+                                      <select value={p.col} onChange={(e) => setEnrichPullCols((prev) => prev.map((x) => x.id === p.id ? { ...x, col: e.target.value } : x))} className="flex-1 border-slate-300 rounded p-2 font-bold text-indigo-700 bg-indigo-50">
+                                        <option value="">Выберите колонку из Источника 2...</option>
                                         {source2.columns.map((c) => <option key={c} value={c}>{c}</option>)}
                                       </select>
                                       {i > 0 && (
-                                        <button type="button" onClick={() => setEnrichKeys((prev) => prev.filter((x) => x.id !== k.id))} className="text-slate-400 hover:text-red-500 p-2">
+                                        <button type="button" onClick={() => setEnrichPullCols((prev) => prev.filter((x) => x.id !== p.id))} className="text-slate-400 hover:text-red-500 p-2">
                                           <Trash2 className="w-4 h-4" />
                                         </button>
                                       )}
                                     </div>
                                   ))}
-                                  <button type="button" onClick={() => setEnrichKeys((prev) => [...prev, { id: Date.now(), k1: '', k2: '' }])} className="text-sm font-bold text-indigo-600">+ Добавить ключ связи</button>
+                                  <button type="button" onClick={() => setEnrichPullCols((prev) => [...prev, { id: Date.now(), col: '' }])} className="text-sm font-bold text-indigo-600">+ Добавить колонку</button>
                                 </div>
                                 <div className="bg-white p-4 rounded-lg border shadow-sm">
-                                  <h4 className="font-bold text-slate-800 text-sm mb-2">Что подтягиваем? (значение)</h4>
-                                  <select value={enrichSourceCol} onChange={(e) => setEnrichSourceCol(e.target.value)} className="w-full border-slate-300 rounded p-2 font-bold text-indigo-700 bg-indigo-50">
-                                    <option value="">Выберите колонку из справочника...</option>
-                                    {source2.columns.map((c) => <option key={c} value={c}>{c}</option>)}
-                                  </select>
+                                  <h4 className="font-bold text-slate-800 text-sm mb-1">Строки без совпадения по критериям:</h4>
+                                  <p className="text-xs text-slate-400 font-medium mb-2">Что делать со строками Источника 1, для которых не нашлось соответствия.</p>
+                                  <div className="flex flex-col sm:flex-row gap-3">
+                                    {[
+                                      ['keep', 'Оставить без новой аналитики'],
+                                      ['exclude', 'Исключить из результата'],
+                                    ].map(([value, label]) => (
+                                      <label key={value} className={`flex items-center gap-2 p-3 rounded-lg border cursor-pointer flex-1 transition ${enrichUnmatched === value ? 'border-indigo-500 bg-indigo-50' : 'border-slate-200 bg-white hover:border-indigo-300'}`}>
+                                        <input type="radio" name="enrich-unmatched" className="accent-indigo-600" checked={enrichUnmatched === value} onChange={() => setEnrichUnmatched(value)} />
+                                        <span className="font-bold text-sm text-slate-800">{label}</span>
+                                      </label>
+                                    ))}
+                                  </div>
                                 </div>
                               </>
                             )}
                           </div>
                         ) : (
                           <div className="space-y-4">
+                            <div className="bg-indigo-50 border border-indigo-200 p-4 rounded-xl">
+                              <h4 className="font-bold text-indigo-900 text-sm mb-2">Имя новой колонки (результат):</h4>
+                              <input type="text" value={enrichTargetCol} onChange={(e) => setEnrichTargetCol(e.target.value)} placeholder="Например: Проект, Категория..." className="w-full border-indigo-300 rounded p-2 font-bold text-indigo-700 bg-white shadow-sm" />
+                            </div>
+                            <div className="bg-emerald-50 border border-emerald-200 p-4 rounded-xl space-y-3">
+                              <div className="flex items-center gap-2">
+                                <Upload className="w-4 h-4 text-emerald-600" />
+                                <h4 className="font-bold text-emerald-900 text-sm">Загрузить правила из Excel / Google Таблицы</h4>
+                              </div>
+                              <p className="text-xs text-emerald-800/80 font-medium">Файл со столбцами: «Колонка», «Условие», «Значение», «Тег». Каждая строка — отдельное правило (количество не ограничено).</p>
+                              <FileSource compact accent="purple" source={enrichRulesSource} title="Загрузите файл с правилами" onFile={(file) => processFile(file, setEnrichRulesSource)} onLink={(kind, value) => {
+                                if (kind === 'link') setEnrichRulesSource((prev) => ({ ...prev, link: value }));
+                                else handleLoadLink(enrichRulesSource, setEnrichRulesSource);
+                              }} />
+                              <LoadedBadge source={enrichRulesSource} onSheetChange={(name) => handleSheetChange(name, setEnrichRulesSource)} />
+                              {enrichRulesSource.isLoaded && (
+                                <button type="button" onClick={importEnrichRules} className="bg-emerald-600 text-white px-4 py-2 rounded-lg font-bold text-sm hover:bg-emerald-700 transition inline-flex items-center gap-2">
+                                  <Upload className="w-4 h-4" /> Импортировать правила из листа «{enrichRulesSource.activeSheet || '—'}»
+                                </button>
+                              )}
+                            </div>
                             <div className="bg-white border border-slate-200 p-5 rounded-xl shadow-sm">
                               <div className="grid grid-cols-1 md:grid-cols-[1.5fr_1fr_1.5fr_1.5fr_auto] gap-3 items-end">
                                 <div>
@@ -543,6 +829,38 @@ export default function App() {
                                 </select>
                               </div>
                             </div>
+                            <div className="bg-white p-4 rounded-lg border shadow-sm space-y-2">
+                              <h4 className="font-bold text-slate-800 text-sm mb-1">Какие колонки из Источника 2 перенести в результат?</h4>
+                              <p className="text-xs text-slate-400 font-medium mb-1">Выберите колонки базы распределения, которые нужно добавить к разбитым строкам. Если колонка уже есть в Источнике 1, значение из базы попадёт в колонку «…_база».</p>
+                              {allocCarryCols.map((p, i) => (
+                                <div key={p.id} className="flex gap-2 items-center">
+                                  <select value={p.col} onChange={(e) => setAllocCarryCols((prev) => prev.map((x) => x.id === p.id ? { ...x, col: e.target.value } : x))} className="flex-1 border-slate-300 rounded p-2 font-bold text-purple-800 bg-purple-50">
+                                    <option value="">Выберите колонку из Источника 2...</option>
+                                    {source2.columns.map((c) => <option key={c} value={c}>{c}</option>)}
+                                  </select>
+                                  {i > 0 && (
+                                    <button type="button" onClick={() => setAllocCarryCols((prev) => prev.filter((x) => x.id !== p.id))} className="text-slate-400 hover:text-red-500 p-2">
+                                      <Trash2 className="w-4 h-4" />
+                                    </button>
+                                  )}
+                                </div>
+                              ))}
+                              <button type="button" onClick={() => setAllocCarryCols((prev) => [...prev, { id: Date.now(), col: '' }])} className="text-sm font-bold text-indigo-600">+ Добавить колонку</button>
+                            </div>
+                            <label className="flex items-center gap-3 bg-white p-4 rounded-lg border shadow-sm cursor-pointer">
+                              <input type="checkbox" checked={allocAggregate} onChange={(e) => setAllocAggregate(e.target.checked)} className="accent-indigo-600 w-4 h-4" />
+                              <span>
+                                <span className="font-bold text-slate-800 text-sm block">Сначала собрать суммы Источника 1 по критериям связи</span>
+                                <span className="text-xs text-slate-400 font-medium">Строки Источника 1 с одинаковыми значениями критериев объединяются (суммы складываются), затем общий итог распределяется по критериям Источника 2.</span>
+                              </span>
+                            </label>
+                            <label className="flex items-center gap-3 bg-white p-4 rounded-lg border shadow-sm cursor-pointer">
+                              <input type="checkbox" checked={allocAddFormula} onChange={(e) => setAllocAddFormula(e.target.checked)} className="accent-indigo-600 w-4 h-4" />
+                              <span>
+                                <span className="font-bold text-slate-800 text-sm block">Добавить колонку с формулой распределения</span>
+                                <span className="text-xs text-slate-400 font-medium">Колонка «_Формула_Расчета» покажет, как рассчитана каждая доля (и пометит строки без совпадения).</span>
+                              </span>
+                            </label>
                             <div className="bg-slate-800 p-4 rounded-xl text-white space-y-2">
                               <h4 className="font-bold text-sm text-slate-300">Формула расчета</h4>
                               <div className="bg-slate-900 p-3 rounded-lg border border-slate-700 font-mono text-xs md:text-sm text-green-400 text-center">
@@ -902,15 +1220,78 @@ export default function App() {
                     <p className="text-slate-500 font-medium mb-8">
                       Система сгенерировала <span className="font-bold text-slate-800">{resultData.length}</span> строк по заданным правилам.
                     </p>
-                    <button type="button" onClick={() => {
-                      try {
-                        exportToExcel(resultData);
-                      } catch (err) {
-                        setErrorMsg(err.message);
-                      }
-                    }} className="bg-green-600 text-white px-10 py-4 rounded-xl font-black text-lg hover:bg-green-700 transition shadow-lg shadow-green-200 inline-flex items-center gap-3">
-                      <Save className="w-6 h-6" /> Скачать итоговый Excel
-                    </button>
+                    {enrichConflicts.length > 0 && (
+                      <div className="max-w-3xl mx-auto text-left bg-amber-50 border-2 border-amber-200 rounded-xl p-4 mb-8">
+                        <h3 className="font-black text-amber-900 text-sm mb-1 flex items-center gap-2">
+                          <AlertCircle className="w-4 h-4" /> Неоднозначные соответствия ({enrichConflicts.length})
+                        </h3>
+                        <p className="text-xs text-amber-800/80 font-medium mb-3">
+                          По этим критериям в Источнике 2 найдено несколько разных значений. Выберите верное — итоговая таблица обновится сразу.
+                        </p>
+                        <div className="space-y-2 max-h-72 overflow-y-auto">
+                          {enrichConflicts.map((c) => (
+                            <div key={c.id} className="bg-white border border-amber-200 rounded-lg p-3 flex flex-col sm:flex-row sm:items-center gap-2">
+                              <div className="flex-1 text-sm text-slate-700">
+                                <span className="font-bold">[{c.label}]</span> → колонка <span className="font-bold">«{c.col}»</span>
+                              </div>
+                              <select value={enrichResolutions[c.id] ?? c.values[0]} onChange={(e) => resolveEnrichConflict(c.id, e.target.value)} className="border border-slate-300 rounded p-2 text-sm bg-white font-bold text-indigo-700 sm:w-64">
+                                {c.values.map((v) => <option key={v} value={v}>{v}</option>)}
+                              </select>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
+                      <button type="button" onClick={() => {
+                        try {
+                          exportToExcel(resultData);
+                        } catch (err) {
+                          setErrorMsg(err.message);
+                        }
+                      }} className="bg-green-600 text-white px-10 py-4 rounded-xl font-black text-lg hover:bg-green-700 transition shadow-lg shadow-green-200 inline-flex items-center gap-3 w-full sm:w-auto justify-center">
+                        <Save className="w-6 h-6" /> Скачать итоговый Excel
+                      </button>
+                      <button type="button" onClick={handleCreateGoogleSheet} disabled={gsheetBusy} className="bg-blue-600 text-white px-10 py-4 rounded-xl font-black text-lg hover:bg-blue-700 transition shadow-lg shadow-blue-200 inline-flex items-center gap-3 w-full sm:w-auto justify-center disabled:opacity-60 disabled:cursor-not-allowed">
+                        <Table className="w-6 h-6" /> {gsheetBusy ? 'Формируем...' : 'Сформировать Google Таблицу'}
+                      </button>
+                    </div>
+                    <div className="mt-4 flex flex-col items-center gap-2">
+                      {gsheetUrl && (
+                        <a href={gsheetUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-2 text-blue-700 font-bold hover:underline">
+                          <ExternalLink className="w-4 h-4" /> Открыть созданную Google Таблицу
+                        </a>
+                      )}
+                      <button type="button" onClick={() => setShowGsheetConfig((v) => !v)} className="inline-flex items-center gap-1.5 text-sm text-blue-700 hover:text-blue-800 font-bold">
+                        <Sliders className="w-4 h-4" /> {showGsheetConfig ? 'Скрыть настройки Google' : 'Настройки Google Таблиц (куда вставить Client ID)'}
+                      </button>
+                      {showGsheetConfig && (
+                        <div ref={gsheetConfigRef} className="w-full max-w-xl bg-blue-50 border-2 border-blue-200 rounded-xl p-4 text-left space-y-3 scroll-mt-24">
+                          <h4 className="font-black text-blue-900 text-sm">Как сформировать Google Таблицу</h4>
+                          <ol className="list-decimal list-inside text-xs text-slate-700 space-y-1.5 leading-relaxed">
+                            <li>Откройте <a className="text-blue-700 font-bold underline" href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener noreferrer">Google Cloud Console → Credentials</a> и создайте <b>OAuth client ID</b> с типом <b>Web application</b>.</li>
+                            <li>Включите <a className="text-blue-700 font-bold underline" href="https://console.cloud.google.com/apis/library/sheets.googleapis.com" target="_blank" rel="noopener noreferrer">Google Sheets API</a> для проекта.</li>
+                            <li>В поле <b>Authorized JavaScript origins</b> добавьте адрес этого приложения:
+                              <span className="font-mono bg-white border border-blue-200 rounded px-1.5 py-0.5 ml-1 inline-block">{appOrigin || 'адрес в адресной строке браузера'}</span>
+                            </li>
+                            <li>Скопируйте полученный <b>Client ID</b> (вида <span className="font-mono">…apps.googleusercontent.com</span>) и вставьте его в поле ниже.</li>
+                          </ol>
+                          <div>
+                            <label className="text-xs font-bold text-slate-600 block mb-1">Google OAuth Client ID</label>
+                            <input type="text" value={gsheetClientId} onChange={(e) => setGsheetClientId(e.target.value)} placeholder="xxxxxxxx.apps.googleusercontent.com" className="w-full border border-slate-300 rounded p-2 text-sm font-mono bg-white" />
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button type="button" onClick={handleCreateGoogleSheet} disabled={!gsheetClientId.trim() || gsheetBusy} className="bg-blue-600 text-white px-4 py-2 rounded-lg font-bold text-sm hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed">
+                              {gsheetBusy ? 'Формируем...' : 'Сохранить и сформировать'}
+                            </button>
+                            {gsheetClientId.trim() && <span className="text-xs text-green-700 font-bold inline-flex items-center gap-1"><Check className="w-3.5 h-3.5" /> Client ID сохранён в браузере</span>}
+                          </div>
+                          <p className="text-xs text-slate-500 leading-relaxed">
+                            Значение хранится только в вашем браузере. Приложение запрашивает доступ лишь к файлам, которые само создаёт (область <span className="font-mono">drive.file</span>).
+                          </p>
+                        </div>
+                      )}
+                    </div>
                   </div>
                   <DataPreview data={resultData} columns={resultColumns} maxRows={50} />
                   <div className="text-center">
@@ -924,6 +1305,93 @@ export default function App() {
           )}
         </div>
       </main>
+
+      {synKey && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={() => setSynModalKeyId(null)}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between p-5 border-b border-slate-200 sticky top-0 bg-white z-10">
+              <div>
+                <h3 className="text-lg font-black text-slate-800">Соответствие значений (словарь синонимов)</h3>
+                <p className="text-xs text-slate-500 font-medium mt-0.5">
+                  <b>{synKey.k1 || '—'}</b> (Источник 1) ↔ <b>{synKey.k2 || '—'}</b> (Источник 2)
+                </p>
+              </div>
+              <button type="button" onClick={() => setSynModalKeyId(null)} className="text-slate-400 hover:text-slate-700 text-2xl leading-none px-2">×</button>
+            </div>
+            <div className="p-5 space-y-5">
+              {!synKey.k1 || !synKey.k2 ? (
+                <p className="text-sm font-bold text-red-600">Сначала выберите обе колонки для этого критерия.</p>
+              ) : (
+                <>
+                  <p className="text-xs text-slate-500 font-medium bg-slate-50 border border-slate-200 rounded-lg p-3">
+                    Свяжите значения, которые означают одно и то же, но записаны по-разному (например, «Мск» → «г. Москва»). Строки будут считаться совпадающими только для заданных пар.
+                  </p>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-xs font-bold text-slate-500 mb-1 block">Значение из Источника 1 ({synKey.k1})</label>
+                      <input type="text" value={synSearchA} onChange={(e) => setSynSearchA(e.target.value)} placeholder="Поиск по значениям..." className="w-full border-slate-300 rounded p-2 text-sm mb-2" />
+                      <div className="border border-slate-300 rounded max-h-40 overflow-y-auto bg-white">
+                        {synValuesA.filter((v) => v.toLowerCase().includes(synSearchA.toLowerCase())).map((v) => (
+                          <button type="button" key={v} onClick={() => setSynInputA(v)} className={`w-full text-left px-3 py-1.5 text-sm border-b border-slate-50 last:border-0 ${synInputA === v ? 'bg-indigo-100 text-indigo-800 font-bold' : 'hover:bg-slate-50 text-slate-700'}`}>
+                            {v}
+                          </button>
+                        ))}
+                        {synValuesA.filter((v) => v.toLowerCase().includes(synSearchA.toLowerCase())).length === 0 && (
+                          <p className="px-3 py-2 text-xs text-slate-400 font-medium">Нет значений</p>
+                        )}
+                      </div>
+                    </div>
+                    <div>
+                      <label className="text-xs font-bold text-slate-500 mb-1 block">Значение из Источника 2 ({synKey.k2})</label>
+                      <input type="text" value={synSearchB} onChange={(e) => setSynSearchB(e.target.value)} placeholder="Поиск по значениям..." className="w-full border-slate-300 rounded p-2 text-sm mb-2" />
+                      <div className="border border-slate-300 rounded max-h-40 overflow-y-auto bg-white">
+                        {synValuesB.filter((v) => v.toLowerCase().includes(synSearchB.toLowerCase())).map((v) => (
+                          <button type="button" key={v} onClick={() => setSynInputB(v)} className={`w-full text-left px-3 py-1.5 text-sm border-b border-slate-50 last:border-0 ${synInputB === v ? 'bg-indigo-100 text-indigo-800 font-bold' : 'hover:bg-slate-50 text-slate-700'}`}>
+                            {v}
+                          </button>
+                        ))}
+                        {synValuesB.filter((v) => v.toLowerCase().includes(synSearchB.toLowerCase())).length === 0 && (
+                          <p className="px-3 py-2 text-xs text-slate-400 font-medium">Нет значений</p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button type="button" onClick={addSynonym} disabled={!synInputA || !synInputB} className="bg-indigo-600 text-white px-4 py-2 rounded-lg font-bold text-sm hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed">
+                      + Добавить соответствие
+                    </button>
+                    <label className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2 rounded-lg font-bold text-sm cursor-pointer inline-flex items-center gap-2">
+                      <Upload className="w-4 h-4" /> Загрузить файл соответствий
+                      <input type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={(e) => { loadSynonymFile(e.target.files?.[0]); e.target.value = ''; }} />
+                    </label>
+                    {(synInputA || synInputB) && (
+                      <span className="text-sm text-slate-500 font-medium">«{synInputA || '…'}» → «{synInputB || '…'}»</span>
+                    )}
+                  </div>
+                  <div>
+                    <h4 className="font-bold text-slate-800 text-sm mb-2">Словарь соответствий ({(synKey.synonyms || []).length})</h4>
+                    {(synKey.synonyms || []).length === 0 ? (
+                      <p className="text-sm text-slate-400 font-medium">Пока нет соответствий. Добавьте пары вручную или загрузите файл.</p>
+                    ) : (
+                      <div className="border border-slate-200 rounded-xl overflow-hidden divide-y divide-slate-100 max-h-60 overflow-y-auto">
+                        {(synKey.synonyms || []).map((p, idx) => (
+                          <div key={idx} className="flex items-center justify-between gap-2 px-3 py-2 bg-white text-sm">
+                            <span className="flex-1 truncate"><b className="text-slate-700">{p.a}</b> <span className="text-slate-400">→</span> <b className="text-indigo-700">{p.b}</b></span>
+                            <button type="button" onClick={() => removeSynonym(idx)} className="text-red-500 hover:text-red-700"><Trash2 className="w-4 h-4" /></button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+            <div className="p-5 border-t border-slate-200 flex justify-end sticky bottom-0 bg-white">
+              <button type="button" onClick={() => setSynModalKeyId(null)} className="bg-slate-800 text-white px-6 py-2.5 rounded-lg font-bold text-sm hover:bg-slate-700">Готово</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

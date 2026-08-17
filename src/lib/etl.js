@@ -9,30 +9,167 @@ import {
   roundMoney,
 } from './parse.js';
 
-export function applyEnrichment({ sourceData, lookupData, config }) {
-  const { mode, targetCol, sourceCol, keys, rules } = config;
-  if (!targetCol) throw new Error('Укажите имя новой колонки');
-
-  if (mode === 'vlookup') {
-    if (!lookupData?.length) throw new Error('Загрузите справочник (Источник 2)');
-    if (!sourceCol) throw new Error('Выберите колонку для извлечения из справочника');
-    const validKeys = (keys || []).filter((k) => k.k1 && k.k2);
-    if (!validKeys.length) throw new Error('Задайте ключи связи');
-
-    const index = new Map();
-    const k2Fields = validKeys.map((k) => k.k2);
-    for (const row of lookupData) {
-      const key = compositeKey(row, k2Fields);
-      if (!index.has(key)) index.set(key, row);
+/**
+ * Build a matcher for a single join criterion.
+ * - exact criteria compare normalized values directly;
+ * - non-exact criteria match through a manual synonym dictionary (value in
+ *   source 1 is declared equivalent to a value in source 2), while still
+ *   accepting a literal match as a natural equivalence.
+ */
+function buildCriteria(validKeys) {
+  return validKeys.map((k) => {
+    const exact = k.exact !== false;
+    const synMap = new Map();
+    if (!exact) {
+      for (const pair of k.synonyms || []) {
+        const a = norm(pair.a);
+        const b = norm(pair.b);
+        if (!a || !b) continue;
+        if (!synMap.has(a)) synMap.set(a, new Set());
+        synMap.get(a).add(b);
+      }
     }
-    const k1Fields = validKeys.map((k) => k.k1);
+    return { k1: k.k1, k2: k.k2, exact, logic: k.logic === 'OR' ? 'OR' : 'AND', synMap };
+  });
+}
 
-    return sourceData.map((r1) => {
-      const match = index.get(compositeKey(r1, k1Fields));
-      return { ...r1, [targetCol]: match ? match[sourceCol] : null };
-    });
+function pairMatches(r1, r2, criteria) {
+  return criteria.reduce((acc, c, idx) => {
+    const a = norm(r1[c.k1]);
+    const b = norm(r2[c.k2]);
+    const matched = c.exact ? a === b : a === b || (c.synMap.get(a)?.has(b) ?? false);
+    if (idx === 0) return matched;
+    return c.logic === 'OR' ? acc || matched : acc && matched;
+  }, false);
+}
+
+/**
+ * Объединение основной базы со справочником с обработкой коллизий 1-ко-многим.
+ *
+ * Возвращает `{ data, conflicts }`. Если по одному набору критериев в справочнике
+ * находится несколько строк с РАЗНЫМИ значениями подтягиваемой колонки, это
+ * фиксируется как конфликт: в `conflicts` попадает список кандидатов, а в ячейку
+ * записывается либо выбранное пользователем значение (`resolutions`), либо первое.
+ */
+export function mergeSources({
+  sourceData,
+  lookupData,
+  keys,
+  pullCols,
+  sourceCol,
+  targetCol,
+  unmatchedAction,
+  resolutions = {},
+}) {
+  if (!lookupData?.length) throw new Error('Загрузите источник для объединения (Источник 2)');
+  const validKeys = (keys || []).filter((k) => k.k1 && k.k2);
+  if (!validKeys.length) throw new Error('Задайте критерии связи');
+
+  const cleanPulls = (pullCols || []).filter(Boolean);
+  const legacy = !cleanPulls.length && sourceCol;
+  const pulls = legacy ? [sourceCol] : cleanPulls;
+  if (!pulls.length) {
+    throw new Error('Выберите хотя бы одну колонку для добавления из Источника 2');
   }
 
+  const existingCols = new Set(sourceData.length ? Object.keys(sourceData[0]) : []);
+  const outNames = pulls.map((col) => {
+    if (legacy && targetCol) return targetCol;
+    return existingCols.has(col) ? `${col} (Источник 2)` : col;
+  });
+
+  const excludeUnmatched = unmatchedAction === 'exclude';
+  const criteria = buildCriteria(validKeys);
+  const keyFields = criteria.map((c) => c.k1);
+
+  // Для каждой строки основной базы собираем ВСЕ совпадения (а не только первое),
+  // чтобы уметь распознавать неоднозначные соответствия.
+  const allExactAnd = criteria.every((c, i) => c.exact && (i === 0 || c.logic === 'AND'));
+  let matchesOf;
+  if (allExactAnd) {
+    const k2Fields = criteria.map((c) => c.k2);
+    const k1Fields = criteria.map((c) => c.k1);
+    const index = new Map();
+    for (const row of lookupData) {
+      const key = compositeKey(row, k2Fields);
+      if (!index.has(key)) index.set(key, []);
+      index.get(key).push(row);
+    }
+    matchesOf = (r1) => index.get(compositeKey(r1, k1Fields)) || [];
+  } else {
+    matchesOf = (r1) => lookupData.filter((r2) => pairMatches(r1, r2, criteria));
+  }
+
+  const conflictsMap = new Map();
+  const data = [];
+  for (const r1 of sourceData) {
+    const matches = matchesOf(r1);
+    if (!matches.length) {
+      if (excludeUnmatched) continue;
+      const out = { ...r1 };
+      outNames.forEach((n) => {
+        out[n] = null;
+      });
+      data.push(out);
+      continue;
+    }
+
+    const out = { ...r1 };
+    const keyLabel = keyFields.map((f) => r1[f]).join(' | ');
+    const keySig = keyFields.map((f) => norm(r1[f])).join('|||');
+    pulls.forEach((col, i) => {
+      const outName = outNames[i];
+      const distinct = [];
+      const seen = new Set();
+      for (const m of matches) {
+        const value = m[col];
+        const nv = norm(value);
+        if (nv === '') continue;
+        if (!seen.has(nv)) {
+          seen.add(nv);
+          distinct.push(value);
+        }
+      }
+      if (distinct.length <= 1) {
+        out[outName] = distinct.length ? distinct[0] : matches[0][col] ?? null;
+        return;
+      }
+      // Конфликт: несколько разных значений под один набор ключей.
+      const conflictId = `${keySig}<<>>${outName}`;
+      if (!conflictsMap.has(conflictId)) {
+        conflictsMap.set(conflictId, {
+          id: conflictId,
+          label: keyLabel,
+          col: outName,
+          values: distinct.map((v) => (v === null || v === undefined ? '' : String(v))),
+        });
+      }
+      const chosen = resolutions[conflictId];
+      out[outName] = chosen !== undefined && chosen !== null ? chosen : distinct[0];
+    });
+    data.push(out);
+  }
+
+  return { data, conflicts: Array.from(conflictsMap.values()) };
+}
+
+export function applyEnrichment({ sourceData, lookupData, config }) {
+  const { mode, targetCol, sourceCol, pullCols, keys, rules, unmatchedAction, resolutions } = config;
+
+  if (mode === 'vlookup') {
+    return mergeSources({
+      sourceData,
+      lookupData,
+      keys,
+      pullCols,
+      sourceCol,
+      targetCol,
+      unmatchedAction,
+      resolutions,
+    }).data;
+  }
+
+  if (!targetCol) throw new Error('Укажите имя новой колонки');
   if (!rules?.length) throw new Error('Добавьте хотя бы одно правило в список');
   return sourceData.map((row) => {
     let newTag = null;
@@ -48,14 +185,44 @@ export function applyEnrichment({ sourceData, lookupData, config }) {
 }
 
 export function applyAllocation({ sourceData, driverData, config }) {
-  const { keys, sumCol, driverCol } = config;
+  const { keys, sumCol, driverCol, carryCols, addFormula = true, aggregateSource = false } = config;
   if (!driverData?.length) throw new Error('Загрузите базу распределения (Источник 2)');
   if (!sumCol || !driverCol) throw new Error('Укажите колонку суммы и драйвера');
   const validKeys = (keys || []).filter((k) => k.k1 && k.k2);
   if (!validKeys.length) throw new Error('Задайте хотя бы один критерий связи');
 
+  const FORMULA_COL = '_Формула_Расчета';
+  // When carryCols is undefined we keep the legacy behavior of copying every
+  // column from the driver row. When it is provided, only carry the selected
+  // columns (an empty list carries nothing but the recomputed sum).
+  const carryAll = carryCols === undefined;
+  const carry = carryAll ? null : (carryCols || []).filter(Boolean);
+  const withStatus = (row, status) => (addFormula ? { ...row, [FORMULA_COL]: status } : { ...row });
+
   const k2Fields = validKeys.map((k) => k.k2);
   const k1Fields = validKeys.map((k) => k.k1);
+
+  // «Сбор данных по критериям»: агрегируем строки Источника 1 с одинаковыми
+  // значениями ключей в одну строку (сумма складывается), затем распределяем.
+  let workingSource = sourceData;
+  if (aggregateSource) {
+    const groups = new Map();
+    for (const row of sourceData) {
+      const key = compositeKey(row, k1Fields);
+      if (!groups.has(key)) {
+        const seed = {};
+        k1Fields.forEach((f) => {
+          seed[f] = row[f];
+        });
+        seed[sumCol] = 0;
+        groups.set(key, seed);
+      }
+      const bucket = groups.get(key);
+      bucket[sumCol] = roundMoney(parseNumeric(bucket[sumCol]) + parseNumeric(row[sumCol]));
+    }
+    workingSource = Array.from(groups.values());
+  }
+
   const buckets = new Map();
   for (const row of driverData) {
     const key = compositeKey(row, k2Fields);
@@ -64,17 +231,17 @@ export function applyAllocation({ sourceData, driverData, config }) {
   }
 
   const finalData = [];
-  for (const r1 of sourceData) {
+  for (const r1 of workingSource) {
     const matches = buckets.get(compositeKey(r1, k1Fields)) || [];
     if (!matches.length) {
-      finalData.push({ ...r1, _Формула_Расчета: 'База не найдена' });
+      finalData.push(withStatus(r1, 'База не найдена'));
       continue;
     }
 
     const origSum = parseNumeric(r1[sumCol]);
     const totalDriver = matches.reduce((s, m) => s + parseNumeric(m[driverCol]), 0);
     if (totalDriver === 0) {
-      finalData.push({ ...r1, _Формула_Расчета: 'Сумма драйверов равна 0' });
+      finalData.push(withStatus(r1, 'Сумма драйверов равна 0'));
       continue;
     }
 
@@ -86,13 +253,15 @@ export function applyAllocation({ sourceData, driverData, config }) {
       allocatedTotal = roundMoney(allocatedTotal + fraction);
 
       const merged = { ...r1 };
-      Object.entries(m).forEach(([k, v]) => {
+      const carryFields = carryAll ? Object.keys(m) : carry;
+      carryFields.forEach((k) => {
         if (k === sumCol) return;
+        const v = m[k];
         if (k in merged && String(merged[k]) !== String(v)) merged[`${k}_база`] = v;
         else merged[k] = v;
       });
       merged[sumCol] = fraction;
-      merged._Формула_Расчета = `${origSum} × (${driver} ÷ ${totalDriver}) = ${fraction}`;
+      if (addFormula) merged[FORMULA_COL] = `${origSum} × (${driver} ÷ ${totalDriver}) = ${fraction}`;
       finalData.push(merged);
     });
   }
@@ -293,6 +462,44 @@ export function runRule(ruleId, ctx) {
     default:
       throw new Error('Неизвестное правило');
   }
+}
+
+/**
+ * Convert rows loaded from an Excel/CSV/Google Sheet into cascade enrichment
+ * rules. Columns are matched by header heuristics with a positional fallback
+ * (column, condition, value, tag).
+ */
+export function rulesFromRows(rows) {
+  if (!rows?.length) return [];
+  const keys = Object.keys(rows[0]);
+  const pick = (subs, fallbackIdx) => {
+    const found = keys.find((key) => subs.some((s) => key.toLowerCase().includes(s)));
+    return found || keys[fallbackIdx];
+  };
+  const colKey = pick(['колон', 'если', 'поле', 'column'], 0);
+  const opKey = pick(['услов', 'операт', 'op'], 1);
+  const valKey = pick(['значен', 'текст', 'val'], 2);
+  const tagKey = pick(['тег', 'резул', 'присво', 'tag'], 3);
+
+  const normalizeOp = (raw) => {
+    const s = String(raw ?? '').trim().toLowerCase();
+    if (['содержит', 'не содержит', 'равно', 'не равно'].includes(s)) return s;
+    if (s.includes('не сод')) return 'не содержит';
+    if (s.includes('сод')) return 'содержит';
+    if (s.includes('не рав') || s === '!=' || s === '<>') return 'не равно';
+    if (s.includes('рав') || s === '=' || s === '==') return 'равно';
+    return 'содержит';
+  };
+
+  return rows
+    .map((row, i) => ({
+      id: Date.now() + i,
+      col: String(row[colKey] ?? '').trim(),
+      op: normalizeOp(row[opKey]),
+      val: String(row[valKey] ?? '').trim(),
+      tag: String(row[tagKey] ?? '').trim(),
+    }))
+    .filter((r) => r.col && r.val && r.tag);
 }
 
 export { columnsFromData };
