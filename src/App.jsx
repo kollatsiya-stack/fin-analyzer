@@ -72,7 +72,7 @@ export default function App() {
   const [enrichKeys, setEnrichKeys] = useState([
     { id: 1, k1: '', k2: '', logic: 'AND', exact: true, synonyms: [] },
   ]);
-  const [enrichSourceCol, setEnrichSourceCol] = useState('');
+  const [enrichPullCols, setEnrichPullCols] = useState([{ id: 1, col: '' }]);
   const [enrichRuleInput, setEnrichRuleInput] = useState({ col: '', op: 'содержит', val: '', tag: '' });
   const [enrichRules, setEnrichRules] = useState([]);
   const [enrichRulesSource, setEnrichRulesSource] = useState(createEmptySource);
@@ -301,7 +301,7 @@ export default function App() {
         config = {
           mode: enrichMode,
           targetCol: enrichTargetCol,
-          sourceCol: enrichSourceCol,
+          pullCols: enrichPullCols.map((p) => p.col).filter(Boolean),
           keys: enrichKeys,
           rules: enrichRules,
         };
@@ -494,10 +494,6 @@ export default function App() {
                             </label>
                           ))}
                         </div>
-                        <div className="bg-indigo-50 border border-indigo-200 p-4 rounded-xl">
-                          <h4 className="font-bold text-indigo-900 text-sm mb-2">Имя новой колонки (результат):</h4>
-                          <input type="text" value={enrichTargetCol} onChange={(e) => setEnrichTargetCol(e.target.value)} placeholder="Например: Проект, Категория..." className="w-full border-indigo-300 rounded p-2 font-bold text-indigo-700 bg-white shadow-sm" />
-                        </div>
                         {enrichMode === 'vlookup' ? (
                           <div className="space-y-4">
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -575,18 +571,33 @@ export default function App() {
                                   ))}
                                   <button type="button" onClick={() => setEnrichKeys((prev) => [...prev, { id: Date.now(), k1: '', k2: '', logic: 'AND', exact: true, synonyms: [] }])} className="text-sm font-bold text-indigo-600">+ Добавить критерий</button>
                                 </div>
-                                <div className="bg-white p-4 rounded-lg border shadow-sm">
-                                  <h4 className="font-bold text-slate-800 text-sm mb-2">Что подтягиваем из Источника 2? (значение)</h4>
-                                  <select value={enrichSourceCol} onChange={(e) => setEnrichSourceCol(e.target.value)} className="w-full border-slate-300 rounded p-2 font-bold text-indigo-700 bg-indigo-50">
-                                    <option value="">Выберите колонку из Источника 2...</option>
-                                    {source2.columns.map((c) => <option key={c} value={c}>{c}</option>)}
-                                  </select>
+                                <div className="bg-white p-4 rounded-lg border shadow-sm space-y-2">
+                                  <h4 className="font-bold text-slate-800 text-sm mb-1">Что подтягиваем из Источника 2? (колонки)</h4>
+                                  <p className="text-xs text-slate-400 font-medium mb-1">Добавьте одну или несколько колонок — каждая станет новой колонкой в результате.</p>
+                                  {enrichPullCols.map((p, i) => (
+                                    <div key={p.id} className="flex gap-2 items-center">
+                                      <select value={p.col} onChange={(e) => setEnrichPullCols((prev) => prev.map((x) => x.id === p.id ? { ...x, col: e.target.value } : x))} className="flex-1 border-slate-300 rounded p-2 font-bold text-indigo-700 bg-indigo-50">
+                                        <option value="">Выберите колонку из Источника 2...</option>
+                                        {source2.columns.map((c) => <option key={c} value={c}>{c}</option>)}
+                                      </select>
+                                      {i > 0 && (
+                                        <button type="button" onClick={() => setEnrichPullCols((prev) => prev.filter((x) => x.id !== p.id))} className="text-slate-400 hover:text-red-500 p-2">
+                                          <Trash2 className="w-4 h-4" />
+                                        </button>
+                                      )}
+                                    </div>
+                                  ))}
+                                  <button type="button" onClick={() => setEnrichPullCols((prev) => [...prev, { id: Date.now(), col: '' }])} className="text-sm font-bold text-indigo-600">+ Добавить колонку</button>
                                 </div>
                               </>
                             )}
                           </div>
                         ) : (
                           <div className="space-y-4">
+                            <div className="bg-indigo-50 border border-indigo-200 p-4 rounded-xl">
+                              <h4 className="font-bold text-indigo-900 text-sm mb-2">Имя новой колонки (результат):</h4>
+                              <input type="text" value={enrichTargetCol} onChange={(e) => setEnrichTargetCol(e.target.value)} placeholder="Например: Проект, Категория..." className="w-full border-indigo-300 rounded p-2 font-bold text-indigo-700 bg-white shadow-sm" />
+                            </div>
                             <div className="bg-emerald-50 border border-emerald-200 p-4 rounded-xl space-y-3">
                               <div className="flex items-center gap-2">
                                 <Upload className="w-4 h-4 text-emerald-600" />
@@ -1101,16 +1112,30 @@ export default function App() {
                     <div>
                       <label className="text-xs font-bold text-slate-500 mb-1 block">Значение из Источника 1 ({synKey.k1})</label>
                       <input type="text" value={synSearchA} onChange={(e) => setSynSearchA(e.target.value)} placeholder="Поиск по значениям..." className="w-full border-slate-300 rounded p-2 text-sm mb-2" />
-                      <select size={6} value={synInputA} onChange={(e) => setSynInputA(e.target.value)} className="w-full border-slate-300 rounded text-sm bg-white">
-                        {synValuesA.filter((v) => v.toLowerCase().includes(synSearchA.toLowerCase())).map((v) => <option key={v} value={v}>{v}</option>)}
-                      </select>
+                      <div className="border border-slate-300 rounded max-h-40 overflow-y-auto bg-white">
+                        {synValuesA.filter((v) => v.toLowerCase().includes(synSearchA.toLowerCase())).map((v) => (
+                          <button type="button" key={v} onClick={() => setSynInputA(v)} className={`w-full text-left px-3 py-1.5 text-sm border-b border-slate-50 last:border-0 ${synInputA === v ? 'bg-indigo-100 text-indigo-800 font-bold' : 'hover:bg-slate-50 text-slate-700'}`}>
+                            {v}
+                          </button>
+                        ))}
+                        {synValuesA.filter((v) => v.toLowerCase().includes(synSearchA.toLowerCase())).length === 0 && (
+                          <p className="px-3 py-2 text-xs text-slate-400 font-medium">Нет значений</p>
+                        )}
+                      </div>
                     </div>
                     <div>
                       <label className="text-xs font-bold text-slate-500 mb-1 block">Значение из Источника 2 ({synKey.k2})</label>
                       <input type="text" value={synSearchB} onChange={(e) => setSynSearchB(e.target.value)} placeholder="Поиск по значениям..." className="w-full border-slate-300 rounded p-2 text-sm mb-2" />
-                      <select size={6} value={synInputB} onChange={(e) => setSynInputB(e.target.value)} className="w-full border-slate-300 rounded text-sm bg-white">
-                        {synValuesB.filter((v) => v.toLowerCase().includes(synSearchB.toLowerCase())).map((v) => <option key={v} value={v}>{v}</option>)}
-                      </select>
+                      <div className="border border-slate-300 rounded max-h-40 overflow-y-auto bg-white">
+                        {synValuesB.filter((v) => v.toLowerCase().includes(synSearchB.toLowerCase())).map((v) => (
+                          <button type="button" key={v} onClick={() => setSynInputB(v)} className={`w-full text-left px-3 py-1.5 text-sm border-b border-slate-50 last:border-0 ${synInputB === v ? 'bg-indigo-100 text-indigo-800 font-bold' : 'hover:bg-slate-50 text-slate-700'}`}>
+                            {v}
+                          </button>
+                        ))}
+                        {synValuesB.filter((v) => v.toLowerCase().includes(synSearchB.toLowerCase())).length === 0 && (
+                          <p className="px-3 py-2 text-xs text-slate-400 font-medium">Нет значений</p>
+                        )}
+                      </div>
                     </div>
                   </div>
                   <div className="flex flex-wrap items-center gap-3">

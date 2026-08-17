@@ -44,14 +44,34 @@ function pairMatches(r1, r2, criteria) {
 }
 
 export function applyEnrichment({ sourceData, lookupData, config }) {
-  const { mode, targetCol, sourceCol, keys, rules } = config;
-  if (!targetCol) throw new Error('Укажите имя новой колонки');
+  const { mode, targetCol, sourceCol, pullCols, keys, rules } = config;
 
   if (mode === 'vlookup') {
     if (!lookupData?.length) throw new Error('Загрузите источник для объединения (Источник 2)');
-    if (!sourceCol) throw new Error('Выберите колонку для извлечения из второго источника');
     const validKeys = (keys || []).filter((k) => k.k1 && k.k2);
     if (!validKeys.length) throw new Error('Задайте критерии связи');
+
+    // Columns to bring in from source 2. Support the new multi-column list and
+    // the legacy single sourceCol/targetCol pair.
+    const cleanPulls = (pullCols || []).filter(Boolean);
+    const legacy = !cleanPulls.length && sourceCol;
+    const pulls = legacy ? [sourceCol] : cleanPulls;
+    if (!pulls.length) {
+      throw new Error('Выберите хотя бы одну колонку для добавления из Источника 2');
+    }
+
+    const existingCols = new Set(sourceData.length ? Object.keys(sourceData[0]) : []);
+    const outNames = pulls.map((col) => {
+      if (legacy && targetCol) return targetCol;
+      return existingCols.has(col) ? `${col} (Источник 2)` : col;
+    });
+    const assign = (r1, match) => {
+      const out = { ...r1 };
+      pulls.forEach((col, i) => {
+        out[outNames[i]] = match ? match[col] : null;
+      });
+      return out;
+    };
 
     const criteria = buildCriteria(validKeys);
     // Fast O(n+m) path when every criterion is an exact AND-match: an index by
@@ -66,18 +86,13 @@ export function applyEnrichment({ sourceData, lookupData, config }) {
         const key = compositeKey(row, k2Fields);
         if (!index.has(key)) index.set(key, row);
       }
-      return sourceData.map((r1) => {
-        const match = index.get(compositeKey(r1, k1Fields));
-        return { ...r1, [targetCol]: match ? match[sourceCol] : null };
-      });
+      return sourceData.map((r1) => assign(r1, index.get(compositeKey(r1, k1Fields))));
     }
 
-    return sourceData.map((r1) => {
-      const match = lookupData.find((r2) => pairMatches(r1, r2, criteria));
-      return { ...r1, [targetCol]: match ? match[sourceCol] : null };
-    });
+    return sourceData.map((r1) => assign(r1, lookupData.find((r2) => pairMatches(r1, r2, criteria))));
   }
 
+  if (!targetCol) throw new Error('Укажите имя новой колонки');
   if (!rules?.length) throw new Error('Добавьте хотя бы одно правило в список');
   return sourceData.map((row) => {
     let newTag = null;

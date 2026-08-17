@@ -89,6 +89,21 @@ describe('enrichment', () => {
     expect(result[1].Менеджер).toBe('Ivanov');
   });
 
+  it('pulls multiple columns from source 2 and suffixes colliding names', () => {
+    const result = applyEnrichment({
+      sourceData: [{ inn: '7701', Округ: 'старое' }],
+      lookupData: [{ inn: '7701', manager: 'Ivanov', Округ: 'ЦФО' }],
+      config: {
+        mode: 'vlookup',
+        pullCols: ['manager', 'Округ'],
+        keys: [{ k1: 'inn', k2: 'inn', logic: 'AND', exact: true }],
+      },
+    });
+    expect(result[0].manager).toBe('Ivanov');
+    expect(result[0]['Округ']).toBe('старое');
+    expect(result[0]['Округ (Источник 2)']).toBe('ЦФО');
+  });
+
   it('matches when EITHER criterion holds using OR logic', () => {
     const result = applyEnrichment({
       sourceData: [{ inn: 'X', phone: '+7 999' }],
