@@ -19,8 +19,14 @@ import {
 import FileSource, { LoadedBadge } from './components/FileSource.jsx';
 import DataPreview from './components/DataPreview.jsx';
 import { columnsFromData, uniqueSorted } from './lib/parse.js';
-import { exportToExcel, loadFromLink, parseMappingFile, readFileAsWorkbook } from './lib/excel.js';
-import { runRule } from './lib/etl.js';
+import {
+  exportToExcel,
+  loadFromLink,
+  pairsFromRows,
+  parseMappingFile,
+  readFileAsWorkbook,
+} from './lib/excel.js';
+import { rulesFromRows, runRule } from './lib/etl.js';
 
 const createEmptySource = () => ({
   file: null,
@@ -36,7 +42,7 @@ const createEmptySource = () => ({
 });
 
 const RULES = [
-  { id: 1, name: 'Обогащение данных', desc: 'Добавление аналитик, VLOOKUP, тегирование', icon: Search, color: 'text-blue-600', bg: 'bg-blue-100', border: 'hover:border-blue-300' },
+  { id: 1, name: 'Обогащение/объединение данных', desc: 'Добавление аналитик, объединение баз, тегирование', icon: Search, color: 'text-blue-600', bg: 'bg-blue-100', border: 'hover:border-blue-300' },
   { id: 2, name: 'Сплитование', desc: 'Аллокация сумм по драйверам и базам', icon: Scissors, color: 'text-orange-600', bg: 'bg-orange-100', border: 'hover:border-orange-300' },
   { id: 3, name: 'Мэппинг', desc: 'Переклассификация и замена значений', icon: RefreshCcw, color: 'text-emerald-600', bg: 'bg-emerald-100', border: 'hover:border-emerald-300' },
   { id: 4, name: 'Элиминация', desc: 'Фильтрация, черные списки, ВГО', icon: Filter, color: 'text-red-600', bg: 'bg-red-100', border: 'hover:border-red-300' },
@@ -63,10 +69,19 @@ export default function App() {
 
   const [enrichMode, setEnrichMode] = useState('rules');
   const [enrichTargetCol, setEnrichTargetCol] = useState('');
-  const [enrichKeys, setEnrichKeys] = useState([{ id: 1, k1: '', k2: '' }]);
+  const [enrichKeys, setEnrichKeys] = useState([
+    { id: 1, k1: '', k2: '', logic: 'AND', exact: true, synonyms: [] },
+  ]);
   const [enrichSourceCol, setEnrichSourceCol] = useState('');
   const [enrichRuleInput, setEnrichRuleInput] = useState({ col: '', op: 'содержит', val: '', tag: '' });
   const [enrichRules, setEnrichRules] = useState([]);
+  const [enrichRulesSource, setEnrichRulesSource] = useState(createEmptySource);
+
+  const [synModalKeyId, setSynModalKeyId] = useState(null);
+  const [synInputA, setSynInputA] = useState('');
+  const [synInputB, setSynInputB] = useState('');
+  const [synSearchA, setSynSearchA] = useState('');
+  const [synSearchB, setSynSearchB] = useState('');
 
   const [allocKeys, setAllocKeys] = useState([{ id: 1, k1: '', k2: '' }]);
   const [allocSumCol, setAllocSumCol] = useState('');
@@ -113,6 +128,80 @@ export default function App() {
     () => (coaAccCol ? uniqueSorted(coaSource.data.map((r) => r[coaAccCol])) : []),
     [coaAccCol, coaSource.data]
   );
+
+  const updateEnrichKey = (id, patch) =>
+    setEnrichKeys((prev) => prev.map((k) => (k.id === id ? { ...k, ...patch } : k)));
+
+  const synKey = enrichKeys.find((k) => k.id === synModalKeyId) || null;
+  const synValuesA = useMemo(
+    () => (synKey?.k1 ? uniqueSorted(source1.data.map((r) => r[synKey.k1])) : []),
+    [synKey?.k1, source1.data]
+  );
+  const synValuesB = useMemo(
+    () => (synKey?.k2 ? uniqueSorted(source2.data.map((r) => r[synKey.k2])) : []),
+    [synKey?.k2, source2.data]
+  );
+
+  const openSynModal = (id) => {
+    setSynInputA('');
+    setSynInputB('');
+    setSynSearchA('');
+    setSynSearchB('');
+    setSynModalKeyId(id);
+  };
+
+  const addSynonym = () => {
+    if (!synKey || !synInputA || !synInputB) return;
+    const exists = (synKey.synonyms || []).some((p) => p.a === synInputA && p.b === synInputB);
+    if (!exists) {
+      updateEnrichKey(synKey.id, { synonyms: [...(synKey.synonyms || []), { a: synInputA, b: synInputB }] });
+    }
+    setSynInputA('');
+    setSynInputB('');
+  };
+
+  const removeSynonym = (idx) => {
+    if (!synKey) return;
+    updateEnrichKey(synKey.id, { synonyms: (synKey.synonyms || []).filter((_, i) => i !== idx) });
+  };
+
+  const loadSynonymFile = async (file) => {
+    if (!file || !synKey) return;
+    try {
+      const parsed = await readFileAsWorkbook(file);
+      const pairs = pairsFromRows(parsed.data);
+      if (!pairs.length) {
+        setErrorMsg('В файле соответствий не найдено пар (нужны минимум две колонки: значение 1 → значение 2)');
+        return;
+      }
+      const existing = new Set((synKey.synonyms || []).map((p) => `${p.a}|||${p.b}`));
+      const merged = [...(synKey.synonyms || [])];
+      for (const p of pairs) {
+        const sig = `${p.a}|||${p.b}`;
+        if (!existing.has(sig)) {
+          existing.add(sig);
+          merged.push(p);
+        }
+      }
+      updateEnrichKey(synKey.id, { synonyms: merged });
+      setErrorMsg('');
+    } catch (err) {
+      setErrorMsg('Ошибка загрузки файла соответствий: ' + err.message);
+    }
+  };
+
+  const importEnrichRules = () => {
+    const imported = rulesFromRows(enrichRulesSource.data);
+    if (!imported.length) {
+      setErrorMsg(
+        'В файле не найдено корректных правил. Нужны колонки: «Колонка», «Условие», «Значение», «Тег».'
+      );
+      return;
+    }
+    setEnrichRules((prev) => [...prev, ...imported]);
+    setSuccessMsg(`Импортировано правил из файла: ${imported.length}`);
+    setErrorMsg('');
+  };
 
   useEffect(() => {
     if (!opsCol || !opsSource.isLoaded || !opsSource.data.length) return;
@@ -393,11 +482,11 @@ export default function App() {
                   <div className="flex-grow overflow-x-auto">
                     {activeRule === 1 && (
                       <div className="space-y-6">
-                        <h3 className="text-xl font-black flex items-center gap-2 text-slate-800"><Search className="text-indigo-500" /> Обогащение данных</h3>
+                        <h3 className="text-xl font-black flex items-center gap-2 text-slate-800"><Search className="text-indigo-500" /> Обогащение/объединение данных</h3>
                         <div className="flex flex-col sm:flex-row gap-4 mb-4">
                           {[
                             ['rules', 'Условная логика (каскад правил)'],
-                            ['vlookup', 'Сопоставление баз (справочник)'],
+                            ['vlookup', 'Сопоставление баз (объединение)'],
                           ].map(([value, label]) => (
                             <label key={value} className={`flex items-center gap-2 p-3 rounded-lg border cursor-pointer flex-1 transition ${enrichMode === value ? 'border-indigo-500 bg-indigo-50' : 'border-slate-200 bg-white hover:border-indigo-300'}`}>
                               <input type="radio" className="hidden" checked={enrichMode === value} onChange={() => setEnrichMode(value)} />
@@ -411,39 +500,85 @@ export default function App() {
                         </div>
                         {enrichMode === 'vlookup' ? (
                           <div className="space-y-4">
-                            <FileSource compact source={source2} title="Загрузите справочник (Источник 2)" onFile={(file) => processFile(file, setSource2)} onLink={(kind, value) => {
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                              <div className="bg-slate-50 border border-slate-200 p-4 rounded-xl">
+                                <h4 className="font-bold text-slate-800 text-sm mb-1">Основной источник (Источник 1)</h4>
+                                {source1.isLoaded ? (
+                                  <p className="text-xs font-bold text-green-700">Загружен: {source1.data.length} строк · {source1.columns.length} колонок</p>
+                                ) : (
+                                  <p className="text-xs font-bold text-red-600">Загрузите основную базу на шаге 1</p>
+                                )}
+                              </div>
+                              <div className="bg-slate-50 border border-slate-200 p-4 rounded-xl">
+                                <h4 className="font-bold text-slate-800 text-sm mb-1">Источник для объединения (Источник 2)</h4>
+                                {source2.isLoaded ? (
+                                  <p className="text-xs font-bold text-green-700">Загружен: {source2.data.length} строк · {source2.columns.length} колонок</p>
+                                ) : (
+                                  <p className="text-xs text-slate-500 font-medium">Загрузите файл или ссылку ниже</p>
+                                )}
+                              </div>
+                            </div>
+                            <FileSource compact source={source2} title="Загрузите источник для объединения (Источник 2)" onFile={(file) => processFile(file, setSource2)} onLink={(kind, value) => {
                               if (kind === 'link') setSource2((prev) => ({ ...prev, link: value }));
                               else handleLoadLink(source2, setSource2);
                             }} />
                             <LoadedBadge source={source2} onSheetChange={(name) => handleSheetChange(name, setSource2)} />
                             {source2.isLoaded && (
                               <>
-                                <div>
-                                  <h4 className="font-bold text-slate-800 text-sm mb-3">Условия связи</h4>
+                                <div className="bg-white border border-slate-200 p-5 rounded-xl shadow-sm space-y-3">
+                                  <div className="flex items-center justify-between flex-wrap gap-2">
+                                    <h4 className="font-bold text-slate-800 text-sm">Критерии связывания баз</h4>
+                                    <span className="text-xs text-slate-400 font-medium">Колонка А (Источник 1) ↔ Колонка Б (Источник 2)</span>
+                                  </div>
                                   {enrichKeys.map((k, i) => (
-                                    <div key={k.id} className="flex gap-2 items-center mb-2">
-                                      <select value={k.k1} onChange={(e) => setEnrichKeys((prev) => prev.map((x) => x.id === k.id ? { ...x, k1: e.target.value } : x))} className="flex-1 border-slate-300 rounded p-2 text-sm bg-white font-medium">
-                                        <option value="">Ключ из основной базы...</option>
-                                        {source1.columns.map((c) => <option key={c} value={c}>{c}</option>)}
-                                      </select>
-                                      <span className="text-slate-400 font-bold">=</span>
-                                      <select value={k.k2} onChange={(e) => setEnrichKeys((prev) => prev.map((x) => x.id === k.id ? { ...x, k2: e.target.value } : x))} className="flex-1 border-slate-300 rounded p-2 text-sm bg-white font-medium">
-                                        <option value="">Ключ из справочника...</option>
-                                        {source2.columns.map((c) => <option key={c} value={c}>{c}</option>)}
-                                      </select>
-                                      {i > 0 && (
-                                        <button type="button" onClick={() => setEnrichKeys((prev) => prev.filter((x) => x.id !== k.id))} className="text-slate-400 hover:text-red-500 p-2">
-                                          <Trash2 className="w-4 h-4" />
-                                        </button>
-                                      )}
+                                    <div key={k.id} className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-3">
+                                      <div className="flex flex-col md:flex-row gap-2 md:items-center">
+                                        {i > 0 ? (
+                                          <select value={k.logic} onChange={(e) => updateEnrichKey(k.id, { logic: e.target.value })} className="w-full md:w-20 border-slate-300 rounded p-2 text-sm bg-white font-bold text-indigo-600">
+                                            <option value="AND">И</option>
+                                            <option value="OR">ИЛИ</option>
+                                          </select>
+                                        ) : (
+                                          <span className="w-full md:w-20 text-xs font-bold text-slate-400 md:text-center">Критерий 1</span>
+                                        )}
+                                        <select value={k.k1} onChange={(e) => updateEnrichKey(k.id, { k1: e.target.value })} className="flex-1 border-slate-300 rounded p-2 text-sm bg-white font-medium">
+                                          <option value="">Колонка из Источника 1...</option>
+                                          {source1.columns.map((c) => <option key={c} value={c}>{c}</option>)}
+                                        </select>
+                                        <span className="text-slate-400 font-bold text-center px-1">↔</span>
+                                        <select value={k.k2} onChange={(e) => updateEnrichKey(k.id, { k2: e.target.value })} className="flex-1 border-slate-300 rounded p-2 text-sm bg-white font-medium">
+                                          <option value="">Колонка из Источника 2...</option>
+                                          {source2.columns.map((c) => <option key={c} value={c}>{c}</option>)}
+                                        </select>
+                                        {i > 0 && (
+                                          <button type="button" onClick={() => setEnrichKeys((prev) => prev.filter((x) => x.id !== k.id))} className="text-slate-400 hover:text-red-500 p-2 self-center">
+                                            <Trash2 className="w-4 h-4" />
+                                          </button>
+                                        )}
+                                      </div>
+                                      <div className="flex flex-wrap items-center gap-3 md:pl-[88px]">
+                                        <label className="flex items-center gap-2 text-sm font-medium text-slate-700 cursor-pointer">
+                                          <input type="checkbox" checked={k.exact !== false} onChange={(e) => {
+                                            const nextExact = e.target.checked;
+                                            updateEnrichKey(k.id, { exact: nextExact });
+                                            if (!nextExact && k.k1 && k.k2) openSynModal(k.id);
+                                          }} />
+                                          Значения в базах полностью совпадают
+                                        </label>
+                                        {k.exact === false && (
+                                          <button type="button" disabled={!k.k1 || !k.k2} onClick={() => openSynModal(k.id)} className="text-sm font-bold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 disabled:opacity-40 disabled:cursor-not-allowed px-3 py-1.5 rounded-lg flex items-center gap-1">
+                                            <Sliders className="w-4 h-4" /> Настроить соответствия ({(k.synonyms || []).length})
+                                          </button>
+                                        )}
+                                      </div>
                                     </div>
                                   ))}
-                                  <button type="button" onClick={() => setEnrichKeys((prev) => [...prev, { id: Date.now(), k1: '', k2: '' }])} className="text-sm font-bold text-indigo-600">+ Добавить ключ связи</button>
+                                  <button type="button" onClick={() => setEnrichKeys((prev) => [...prev, { id: Date.now(), k1: '', k2: '', logic: 'AND', exact: true, synonyms: [] }])} className="text-sm font-bold text-indigo-600">+ Добавить критерий</button>
                                 </div>
                                 <div className="bg-white p-4 rounded-lg border shadow-sm">
-                                  <h4 className="font-bold text-slate-800 text-sm mb-2">Что подтягиваем? (значение)</h4>
+                                  <h4 className="font-bold text-slate-800 text-sm mb-2">Что подтягиваем из Источника 2? (значение)</h4>
                                   <select value={enrichSourceCol} onChange={(e) => setEnrichSourceCol(e.target.value)} className="w-full border-slate-300 rounded p-2 font-bold text-indigo-700 bg-indigo-50">
-                                    <option value="">Выберите колонку из справочника...</option>
+                                    <option value="">Выберите колонку из Источника 2...</option>
                                     {source2.columns.map((c) => <option key={c} value={c}>{c}</option>)}
                                   </select>
                                 </div>
@@ -452,6 +587,23 @@ export default function App() {
                           </div>
                         ) : (
                           <div className="space-y-4">
+                            <div className="bg-emerald-50 border border-emerald-200 p-4 rounded-xl space-y-3">
+                              <div className="flex items-center gap-2">
+                                <Upload className="w-4 h-4 text-emerald-600" />
+                                <h4 className="font-bold text-emerald-900 text-sm">Загрузить правила из Excel / Google Таблицы</h4>
+                              </div>
+                              <p className="text-xs text-emerald-800/80 font-medium">Файл со столбцами: «Колонка», «Условие», «Значение», «Тег». Каждая строка — отдельное правило (количество не ограничено).</p>
+                              <FileSource compact accent="purple" source={enrichRulesSource} title="Загрузите файл с правилами" onFile={(file) => processFile(file, setEnrichRulesSource)} onLink={(kind, value) => {
+                                if (kind === 'link') setEnrichRulesSource((prev) => ({ ...prev, link: value }));
+                                else handleLoadLink(enrichRulesSource, setEnrichRulesSource);
+                              }} />
+                              <LoadedBadge source={enrichRulesSource} onSheetChange={(name) => handleSheetChange(name, setEnrichRulesSource)} />
+                              {enrichRulesSource.isLoaded && (
+                                <button type="button" onClick={importEnrichRules} className="bg-emerald-600 text-white px-4 py-2 rounded-lg font-bold text-sm hover:bg-emerald-700 transition inline-flex items-center gap-2">
+                                  <Upload className="w-4 h-4" /> Импортировать правила из листа «{enrichRulesSource.activeSheet || '—'}»
+                                </button>
+                              )}
+                            </div>
                             <div className="bg-white border border-slate-200 p-5 rounded-xl shadow-sm">
                               <div className="grid grid-cols-1 md:grid-cols-[1.5fr_1fr_1.5fr_1.5fr_auto] gap-3 items-end">
                                 <div>
@@ -924,6 +1076,79 @@ export default function App() {
           )}
         </div>
       </main>
+
+      {synKey && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={() => setSynModalKeyId(null)}>
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between p-5 border-b border-slate-200 sticky top-0 bg-white z-10">
+              <div>
+                <h3 className="text-lg font-black text-slate-800">Соответствие значений (словарь синонимов)</h3>
+                <p className="text-xs text-slate-500 font-medium mt-0.5">
+                  <b>{synKey.k1 || '—'}</b> (Источник 1) ↔ <b>{synKey.k2 || '—'}</b> (Источник 2)
+                </p>
+              </div>
+              <button type="button" onClick={() => setSynModalKeyId(null)} className="text-slate-400 hover:text-slate-700 text-2xl leading-none px-2">×</button>
+            </div>
+            <div className="p-5 space-y-5">
+              {!synKey.k1 || !synKey.k2 ? (
+                <p className="text-sm font-bold text-red-600">Сначала выберите обе колонки для этого критерия.</p>
+              ) : (
+                <>
+                  <p className="text-xs text-slate-500 font-medium bg-slate-50 border border-slate-200 rounded-lg p-3">
+                    Свяжите значения, которые означают одно и то же, но записаны по-разному (например, «Мск» → «г. Москва»). Строки будут считаться совпадающими только для заданных пар.
+                  </p>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-xs font-bold text-slate-500 mb-1 block">Значение из Источника 1 ({synKey.k1})</label>
+                      <input type="text" value={synSearchA} onChange={(e) => setSynSearchA(e.target.value)} placeholder="Поиск по значениям..." className="w-full border-slate-300 rounded p-2 text-sm mb-2" />
+                      <select size={6} value={synInputA} onChange={(e) => setSynInputA(e.target.value)} className="w-full border-slate-300 rounded text-sm bg-white">
+                        {synValuesA.filter((v) => v.toLowerCase().includes(synSearchA.toLowerCase())).map((v) => <option key={v} value={v}>{v}</option>)}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="text-xs font-bold text-slate-500 mb-1 block">Значение из Источника 2 ({synKey.k2})</label>
+                      <input type="text" value={synSearchB} onChange={(e) => setSynSearchB(e.target.value)} placeholder="Поиск по значениям..." className="w-full border-slate-300 rounded p-2 text-sm mb-2" />
+                      <select size={6} value={synInputB} onChange={(e) => setSynInputB(e.target.value)} className="w-full border-slate-300 rounded text-sm bg-white">
+                        {synValuesB.filter((v) => v.toLowerCase().includes(synSearchB.toLowerCase())).map((v) => <option key={v} value={v}>{v}</option>)}
+                      </select>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button type="button" onClick={addSynonym} disabled={!synInputA || !synInputB} className="bg-indigo-600 text-white px-4 py-2 rounded-lg font-bold text-sm hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed">
+                      + Добавить соответствие
+                    </button>
+                    <label className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2 rounded-lg font-bold text-sm cursor-pointer inline-flex items-center gap-2">
+                      <Upload className="w-4 h-4" /> Загрузить файл соответствий
+                      <input type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={(e) => { loadSynonymFile(e.target.files?.[0]); e.target.value = ''; }} />
+                    </label>
+                    {(synInputA || synInputB) && (
+                      <span className="text-sm text-slate-500 font-medium">«{synInputA || '…'}» → «{synInputB || '…'}»</span>
+                    )}
+                  </div>
+                  <div>
+                    <h4 className="font-bold text-slate-800 text-sm mb-2">Словарь соответствий ({(synKey.synonyms || []).length})</h4>
+                    {(synKey.synonyms || []).length === 0 ? (
+                      <p className="text-sm text-slate-400 font-medium">Пока нет соответствий. Добавьте пары вручную или загрузите файл.</p>
+                    ) : (
+                      <div className="border border-slate-200 rounded-xl overflow-hidden divide-y divide-slate-100 max-h-60 overflow-y-auto">
+                        {(synKey.synonyms || []).map((p, idx) => (
+                          <div key={idx} className="flex items-center justify-between gap-2 px-3 py-2 bg-white text-sm">
+                            <span className="flex-1 truncate"><b className="text-slate-700">{p.a}</b> <span className="text-slate-400">→</span> <b className="text-indigo-700">{p.b}</b></span>
+                            <button type="button" onClick={() => removeSynonym(idx)} className="text-red-500 hover:text-red-700"><Trash2 className="w-4 h-4" /></button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+            <div className="p-5 border-t border-slate-200 flex justify-end sticky bottom-0 bg-white">
+              <button type="button" onClick={() => setSynModalKeyId(null)} className="bg-slate-800 text-white px-6 py-2.5 rounded-lg font-bold text-sm hover:bg-slate-700">Готово</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

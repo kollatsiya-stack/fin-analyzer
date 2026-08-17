@@ -9,26 +9,71 @@ import {
   roundMoney,
 } from './parse.js';
 
+/**
+ * Build a matcher for a single join criterion.
+ * - exact criteria compare normalized values directly;
+ * - non-exact criteria match through a manual synonym dictionary (value in
+ *   source 1 is declared equivalent to a value in source 2), while still
+ *   accepting a literal match as a natural equivalence.
+ */
+function buildCriteria(validKeys) {
+  return validKeys.map((k) => {
+    const exact = k.exact !== false;
+    const synMap = new Map();
+    if (!exact) {
+      for (const pair of k.synonyms || []) {
+        const a = norm(pair.a);
+        const b = norm(pair.b);
+        if (!a || !b) continue;
+        if (!synMap.has(a)) synMap.set(a, new Set());
+        synMap.get(a).add(b);
+      }
+    }
+    return { k1: k.k1, k2: k.k2, exact, logic: k.logic === 'OR' ? 'OR' : 'AND', synMap };
+  });
+}
+
+function pairMatches(r1, r2, criteria) {
+  return criteria.reduce((acc, c, idx) => {
+    const a = norm(r1[c.k1]);
+    const b = norm(r2[c.k2]);
+    const matched = c.exact ? a === b : a === b || (c.synMap.get(a)?.has(b) ?? false);
+    if (idx === 0) return matched;
+    return c.logic === 'OR' ? acc || matched : acc && matched;
+  }, false);
+}
+
 export function applyEnrichment({ sourceData, lookupData, config }) {
   const { mode, targetCol, sourceCol, keys, rules } = config;
   if (!targetCol) throw new Error('Укажите имя новой колонки');
 
   if (mode === 'vlookup') {
-    if (!lookupData?.length) throw new Error('Загрузите справочник (Источник 2)');
-    if (!sourceCol) throw new Error('Выберите колонку для извлечения из справочника');
+    if (!lookupData?.length) throw new Error('Загрузите источник для объединения (Источник 2)');
+    if (!sourceCol) throw new Error('Выберите колонку для извлечения из второго источника');
     const validKeys = (keys || []).filter((k) => k.k1 && k.k2);
-    if (!validKeys.length) throw new Error('Задайте ключи связи');
+    if (!validKeys.length) throw new Error('Задайте критерии связи');
 
-    const index = new Map();
-    const k2Fields = validKeys.map((k) => k.k2);
-    for (const row of lookupData) {
-      const key = compositeKey(row, k2Fields);
-      if (!index.has(key)) index.set(key, row);
+    const criteria = buildCriteria(validKeys);
+    // Fast O(n+m) path when every criterion is an exact AND-match: an index by
+    // composite key covers it. OR-logic or synonym dictionaries need a scan.
+    const allExactAnd = criteria.every((c, i) => c.exact && (i === 0 || c.logic === 'AND'));
+
+    if (allExactAnd) {
+      const k2Fields = criteria.map((c) => c.k2);
+      const k1Fields = criteria.map((c) => c.k1);
+      const index = new Map();
+      for (const row of lookupData) {
+        const key = compositeKey(row, k2Fields);
+        if (!index.has(key)) index.set(key, row);
+      }
+      return sourceData.map((r1) => {
+        const match = index.get(compositeKey(r1, k1Fields));
+        return { ...r1, [targetCol]: match ? match[sourceCol] : null };
+      });
     }
-    const k1Fields = validKeys.map((k) => k.k1);
 
     return sourceData.map((r1) => {
-      const match = index.get(compositeKey(r1, k1Fields));
+      const match = lookupData.find((r2) => pairMatches(r1, r2, criteria));
       return { ...r1, [targetCol]: match ? match[sourceCol] : null };
     });
   }
@@ -293,6 +338,44 @@ export function runRule(ruleId, ctx) {
     default:
       throw new Error('Неизвестное правило');
   }
+}
+
+/**
+ * Convert rows loaded from an Excel/CSV/Google Sheet into cascade enrichment
+ * rules. Columns are matched by header heuristics with a positional fallback
+ * (column, condition, value, tag).
+ */
+export function rulesFromRows(rows) {
+  if (!rows?.length) return [];
+  const keys = Object.keys(rows[0]);
+  const pick = (subs, fallbackIdx) => {
+    const found = keys.find((key) => subs.some((s) => key.toLowerCase().includes(s)));
+    return found || keys[fallbackIdx];
+  };
+  const colKey = pick(['колон', 'если', 'поле', 'column'], 0);
+  const opKey = pick(['услов', 'операт', 'op'], 1);
+  const valKey = pick(['значен', 'текст', 'val'], 2);
+  const tagKey = pick(['тег', 'резул', 'присво', 'tag'], 3);
+
+  const normalizeOp = (raw) => {
+    const s = String(raw ?? '').trim().toLowerCase();
+    if (['содержит', 'не содержит', 'равно', 'не равно'].includes(s)) return s;
+    if (s.includes('не сод')) return 'не содержит';
+    if (s.includes('сод')) return 'содержит';
+    if (s.includes('не рав') || s === '!=' || s === '<>') return 'не равно';
+    if (s.includes('рав') || s === '=' || s === '==') return 'равно';
+    return 'содержит';
+  };
+
+  return rows
+    .map((row, i) => ({
+      id: Date.now() + i,
+      col: String(row[colKey] ?? '').trim(),
+      op: normalizeOp(row[opKey]),
+      val: String(row[valKey] ?? '').trim(),
+      tag: String(row[tagKey] ?? '').trim(),
+    }))
+    .filter((r) => r.col && r.val && r.tag);
 }
 
 export { columnsFromData };

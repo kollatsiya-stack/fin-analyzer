@@ -137,4 +137,22 @@ export function parseMappingFile(buffer) {
   }));
 }
 
+/**
+ * Read a two-column correspondence file into synonym pairs. The first column is
+ * treated as the value in source 1, the second as the equivalent in source 2.
+ */
+export function pairsFromRows(rows) {
+  if (!rows?.length) return [];
+  const keys = Object.keys(rows[0]);
+  if (keys.length < 2) return [];
+  const c1 = keys.find((k) => /исходн|источник\s*1|source\s*1|слева|left/i.test(k)) || keys[0];
+  const c2 =
+    keys.find((k) => /эталон|соответ|источник\s*2|source\s*2|справа|right/i.test(k)) ||
+    keys.find((k) => k !== c1) ||
+    keys[1];
+  return rows
+    .map((r) => ({ a: String(r[c1] ?? '').trim(), b: String(r[c2] ?? '').trim() }))
+    .filter((p) => p.a && p.b);
+}
+
 export { columnsFromData };

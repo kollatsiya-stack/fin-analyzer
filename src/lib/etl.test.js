@@ -9,7 +9,9 @@ import {
   applyMapping,
   applyPostings,
   applyRevaluation,
+  rulesFromRows,
 } from './etl.js';
+import { pairsFromRows } from './excel.js';
 
 describe('parseNumeric', () => {
   it('parses US and EU formats', () => {
@@ -64,6 +66,117 @@ describe('enrichment', () => {
       },
     });
     expect(result.map((r) => r.Категория)).toEqual(['Аренда', 'Прочее']);
+  });
+
+  it('matches on multiple exact criteria combined with AND', () => {
+    const result = applyEnrichment({
+      sourceData: [
+        { inn: '7701', kpp: '7701001', name: 'A' },
+        { inn: '7701', kpp: '7701002', name: 'B' },
+      ],
+      lookupData: [{ inn: '7701', kpp: '7701002', manager: 'Ivanov' }],
+      config: {
+        mode: 'vlookup',
+        targetCol: 'Менеджер',
+        sourceCol: 'manager',
+        keys: [
+          { k1: 'inn', k2: 'inn', logic: 'AND', exact: true },
+          { k1: 'kpp', k2: 'kpp', logic: 'AND', exact: true },
+        ],
+      },
+    });
+    expect(result[0].Менеджер).toBe(null);
+    expect(result[1].Менеджер).toBe('Ivanov');
+  });
+
+  it('matches when EITHER criterion holds using OR logic', () => {
+    const result = applyEnrichment({
+      sourceData: [{ inn: 'X', phone: '+7 999' }],
+      lookupData: [{ inn: 'other', phone: '+7 999', tag: 'Найдено' }],
+      config: {
+        mode: 'vlookup',
+        targetCol: 'Метка',
+        sourceCol: 'tag',
+        keys: [
+          { k1: 'inn', k2: 'inn', logic: 'AND', exact: true },
+          { k1: 'phone', k2: 'phone', logic: 'OR', exact: true },
+        ],
+      },
+    });
+    expect(result[0].Метка).toBe('Найдено');
+  });
+
+  it('matches differently-written values through a synonym dictionary', () => {
+    const result = applyEnrichment({
+      sourceData: [{ city: 'Мск' }, { city: 'СПб' }],
+      lookupData: [
+        { town: 'г. Москва', region: 'ЦФО' },
+        { town: 'г. Санкт-Петербург', region: 'СЗФО' },
+      ],
+      config: {
+        mode: 'vlookup',
+        targetCol: 'Округ',
+        sourceCol: 'region',
+        keys: [
+          {
+            k1: 'city',
+            k2: 'town',
+            logic: 'AND',
+            exact: false,
+            synonyms: [
+              { a: 'Мск', b: 'г. Москва' },
+              { a: 'СПб', b: 'г. Санкт-Петербург' },
+            ],
+          },
+        ],
+      },
+    });
+    expect(result.map((r) => r.Округ)).toEqual(['ЦФО', 'СЗФО']);
+  });
+
+  it('does not match non-exact values missing from the dictionary', () => {
+    const result = applyEnrichment({
+      sourceData: [{ city: 'Мск' }],
+      lookupData: [{ town: 'г. Москва', region: 'ЦФО' }],
+      config: {
+        mode: 'vlookup',
+        targetCol: 'Округ',
+        sourceCol: 'region',
+        keys: [{ k1: 'city', k2: 'town', logic: 'AND', exact: false, synonyms: [] }],
+      },
+    });
+    expect(result[0].Округ).toBe(null);
+  });
+});
+
+describe('rulesFromRows', () => {
+  it('maps rows to cascade rules with header heuristics', () => {
+    const rules = rulesFromRows([
+      { Колонка: 'name', Условие: 'содержит', Значение: 'Аренда', Тег: 'Аренда' },
+      { Колонка: 'name', Условие: '=', Значение: 'Кофе', Тег: 'Прочее' },
+    ]);
+    expect(rules).toHaveLength(2);
+    expect(rules[0]).toMatchObject({ col: 'name', op: 'содержит', val: 'Аренда', tag: 'Аренда' });
+    expect(rules[1].op).toBe('равно');
+  });
+
+  it('falls back to positional columns and drops incomplete rows', () => {
+    const rules = rulesFromRows([
+      { A: 'col', B: '<>', C: 'x', D: 'Tag' },
+      { A: 'col', B: '', C: '', D: '' },
+    ]);
+    expect(rules).toHaveLength(1);
+    expect(rules[0]).toMatchObject({ col: 'col', op: 'не равно', val: 'x', tag: 'Tag' });
+  });
+});
+
+describe('pairsFromRows', () => {
+  it('reads two-column correspondence files into a→b pairs', () => {
+    const pairs = pairsFromRows([
+      { Исходное: 'Мск', Эталон: 'г. Москва' },
+      { Исходное: '', Эталон: 'skip' },
+    ]);
+    expect(pairs).toEqual([{ a: 'Мск', b: 'г. Москва' }]);
   });
 });
 
