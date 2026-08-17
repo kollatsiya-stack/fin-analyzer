@@ -11,7 +11,7 @@ import {
   applyRevaluation,
   rulesFromRows,
 } from './etl.js';
-import { pairsFromRows } from './excel.js';
+import { pairsFromRows, readArrayBuffer } from './excel.js';
 import { buildSpreadsheetBody, resultToValues } from './gsheets.js';
 
 describe('parseNumeric', () => {
@@ -257,6 +257,16 @@ describe('google sheets export', () => {
     expect(body.properties.title).toBe('T');
     expect(rowData[0].values[0].userEnteredValue).toEqual({ stringValue: 'Город' });
     expect(rowData[1].values[1].userEnteredValue).toEqual({ numberValue: 100 });
+  });
+});
+
+describe('readArrayBuffer encoding', () => {
+  it('decodes a BOM-less UTF-8 CSV with Cyrillic headers correctly', () => {
+    const csv = 'Город,Округ\nМск,ЦФО\n';
+    const bytes = new TextEncoder().encode(csv);
+    const parsed = readArrayBuffer(bytes.buffer);
+    expect(parsed.columns).toEqual(['Город', 'Округ']);
+    expect(parsed.data[0]).toEqual({ Город: 'Мск', Округ: 'ЦФО' });
   });
 });
 

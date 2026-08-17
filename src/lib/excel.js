@@ -39,6 +39,17 @@ export function parseWorkbook(workbook) {
 }
 
 export function readArrayBuffer(buffer) {
+  const bytes = new Uint8Array(buffer);
+  // XLSX is a ZIP ("PK"), legacy XLS is an OLE compound file. Anything else is
+  // treated as text (CSV/TSV) and decoded as UTF-8 — SheetJS otherwise guesses
+  // Windows-1252 for a BOM-less CSV and mangles Cyrillic.
+  const isZip = bytes[0] === 0x50 && bytes[1] === 0x4b;
+  const isOle = bytes[0] === 0xd0 && bytes[1] === 0xcf;
+  if (!isZip && !isOle) {
+    let text = new TextDecoder('utf-8').decode(bytes);
+    if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+    return parseWorkbook(XLSX.read(text, { type: 'string' }));
+  }
   return parseWorkbook(XLSX.read(buffer, { type: 'array' }));
 }
 
