@@ -5,31 +5,10 @@
  * getFilteredTransactions and calculateDoubleEntrySum share the same funnel so
  * the drill-down footer matches the cell value to the kopeck.
  */
-import { cellText, columnsFromData, parseNumeric, roundMoney } from './parse.js';
+import { cellText, columnsFromData, parseNumeric, roundMoney, toDateKey } from './parse.js';
 import { detectPostingColumns } from './reports1c.js';
 
-/** Parse date to YYYY-MM-DD comparable string, or null. */
-export function toDateKey(raw) {
-  if (raw == null || raw === '') return null;
-  if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
-    return raw.toISOString().slice(0, 10);
-  }
-  if (typeof raw === 'number' && Number.isFinite(raw)) {
-    // Excel serial (days since 1899-12-30)
-    const epoch = Date.UTC(1899, 11, 30) + Math.round(raw) * 86400000;
-    return new Date(epoch).toISOString().slice(0, 10);
-  }
-  const s = String(raw).trim();
-  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
-  const m = s.match(/^(\d{1,2})[./](\d{1,2})[./](\d{2,4})/);
-  if (m) {
-    const y = m[3].length === 2 ? `20${m[3]}` : m[3];
-    return `${y}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
-  }
-  const d = new Date(s);
-  if (!Number.isNaN(d.getTime())) return d.toISOString().slice(0, 10);
-  return null;
-}
+export { toDateKey };
 
 /** Account match: exact or child sub-account (50 matches 50.01). */
 export function accountMatches(code, targets = []) {
