@@ -14,7 +14,8 @@ export default function SourcePicker({
   allowEmpty = true,
   className = '',
 }) {
-  const options = (sources || []).filter((s) => !excludeIds.includes(s.id));
+  const all = sources || [];
+  const options = all.filter((s) => !excludeIds.includes(s.id));
   return (
     <div className={className}>
       {label && <label className="text-xs font-bold text-slate-500 mb-1 block">{label}</label>}
@@ -32,7 +33,9 @@ export default function SourcePicker({
       </select>
       {options.length === 0 && (
         <p className="text-xs text-amber-700 font-medium mt-1">
-          Реестр пуст — загрузите источники на шаге 1.
+          {all.length === 0
+            ? 'Реестр пуст — загрузите источники на шаге 1.'
+            : 'Нет других таблиц в реестре (загрузите нужный справочник на шаге 1).'}
         </p>
       )}
     </div>
