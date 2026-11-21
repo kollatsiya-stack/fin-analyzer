@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
+import { toDateKey } from './parse.js';
 import {
+  accountMatchesFilter,
   buildAccountAnalysis,
   buildAccountCard,
   buildOsv,
   buildSubcontoAnalysis,
+  dateBucket,
   normalizeAccountCode,
   splitBalance,
 } from './reports1c.js';
@@ -19,11 +22,27 @@ const postings = [
   { Дата: '2024-02-01', 'Счет Дт': '51', 'Счет Кт': '62.01', Сумма: 999, Организация: 'Альфа' },
 ];
 
-describe('normalizeAccountCode', () => {
+describe('toDateKey / dateBucket', () => {
+  it('parses DD.MM.YYYY with time and includes whole dateTo day', () => {
+    expect(toDateKey('15.01.2024 18:30:00')).toBe('2024-01-15');
+    expect(toDateKey('2024-01-31T23:59:59')).toBe('2024-01-31');
+    expect(dateBucket('2024-01-31', '2024-01-01', '2024-01-31')).toBe('turnover');
+    expect(dateBucket('2023-12-31', '2024-01-01', '2024-01-31')).toBe('opening');
+    expect(dateBucket(null, '2024-01-01', '2024-01-31')).toBe('skip');
+  });
+});
+
+describe('normalizeAccountCode / accountMatchesFilter', () => {
   it('treats 62.1 and 62.01 as the same', () => {
     expect(normalizeAccountCode('62.1')).toBe('62.01');
     expect(normalizeAccountCode('62.01')).toBe('62.01');
     expect(normalizeAccountCode('60.1')).toBe(normalizeAccountCode('60.01'));
+  });
+
+  it('does not match prefix 6 to 60', () => {
+    expect(accountMatchesFilter('60', ['6'])).toBe(false);
+    expect(accountMatchesFilter('60.01', ['60'])).toBe(true);
+    expect(accountMatchesFilter('600', ['60'])).toBe(false);
   });
 });
 
@@ -83,6 +102,33 @@ describe('buildOsv', () => {
       accountFilters: ['51'],
     });
     expect(data.every((r) => normalizeAccountCode(r.Счет) === '51')).toBe(true);
+  });
+
+  it('skips unrecognized dates when period is set', () => {
+    const mixed = [
+      ...postings,
+      { Дата: 'не дата', 'Счет Дт': '51', 'Счет Кт': '62.01', Сумма: 777, Организация: 'Альфа' },
+    ];
+    const { data, skippedDates } = buildOsv({
+      postings: mixed,
+      dateFrom: '2024-01-01',
+      dateTo: '2024-01-31',
+    });
+    expect(skippedDates.length).toBe(1);
+    const a51 = data.find((r) => normalizeAccountCode(r.Счет) === '51');
+    expect(a51['Оборот Дт']).toBe(1050);
+  });
+
+  it('includes DD.MM.YYYY datetime on dateTo boundary', () => {
+    const rows = [
+      { Дата: '31.01.2024 23:15:00', 'Счет Дт': '51', 'Счет Кт': '62.01', Сумма: 10 },
+    ];
+    const { data } = buildOsv({
+      postings: rows,
+      dateFrom: '2024-01-01',
+      dateTo: '2024-01-31',
+    });
+    expect(data.find((r) => r.Счет === '51')['Оборот Дт']).toBe(10);
   });
 });
 

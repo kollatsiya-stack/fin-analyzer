@@ -97,24 +97,44 @@ export function roundMoney(n) {
   return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 }
 
-/** Parse date-like values to YYYY-MM-DD for comparisons. */
+/**
+ * Parse date-like values to YYYY-MM-DD (local calendar day).
+ * Supports Date, Excel serial, ISO, DD.MM.YYYY[, HH:mm[:ss]].
+ */
 export function toDateKey(raw) {
   if (raw == null || raw === '') return null;
   if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
-    return raw.toISOString().slice(0, 10);
+    const y = raw.getFullYear();
+    const m = String(raw.getMonth() + 1).padStart(2, '0');
+    const d = String(raw.getDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
   }
   if (typeof raw === 'number' && Number.isFinite(raw)) {
+    // Excel serial day (UTC noon to avoid TZ day-shift)
     const epoch = Date.UTC(1899, 11, 30) + Math.round(raw) * 86400000;
-    return new Date(epoch).toISOString().slice(0, 10);
+    const dt = new Date(epoch);
+    const y = dt.getUTCFullYear();
+    const m = String(dt.getUTCMonth() + 1).padStart(2, '0');
+    const d = String(dt.getUTCDate()).padStart(2, '0');
+    return `${y}-${m}-${d}`;
   }
   const s = String(raw).trim();
-  if (/^\d{4}-\d{2}-\d{2}/.test(s)) return s.slice(0, 10);
-  const m = s.match(/^(\d{1,2})[./](\d{1,2})[./](\d{2,4})/);
-  if (m) {
-    const y = m[3].length === 2 ? `20${m[3]}` : m[3];
-    return `${y}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+  if (!s) return null;
+  // ISO / YYYY-MM-DD[ T/ ]HH:mm:ss
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+  // DD.MM.YYYY or DD/MM/YYYY[, HH:mm[:ss]]
+  const dmy = s.match(/^(\d{1,2})[./](\d{1,2})[./](\d{2,4})(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?/);
+  if (dmy) {
+    const y = dmy[3].length === 2 ? `20${dmy[3]}` : dmy[3];
+    return `${y}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}`;
   }
   const d = new Date(s);
-  if (!Number.isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  if (!Number.isNaN(d.getTime())) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  }
   return null;
 }

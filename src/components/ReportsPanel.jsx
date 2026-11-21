@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Play } from 'lucide-react';
 import DataPreview from './DataPreview.jsx';
 import SourcePicker from './SourcePicker.jsx';
@@ -11,6 +11,7 @@ import {
   detectPostingColumns,
   listAccountsInPostings,
   listAnalyticsColumns,
+  parseAccountList,
 } from '../lib/reports1c.js';
 import { exportToExcel } from '../lib/excel.js';
 import { uniqueSorted } from '../lib/parse.js';
@@ -40,6 +41,7 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
   const [subcontoSide, setSubcontoSide] = useState('both');
   const [groupByAccount, setGroupByAccount] = useState(true);
   const [result, setResult] = useState(null);
+  const autoRun = useRef(false);
 
   const postings = sources.find((s) => s.id === postingsId) || null;
   const coa = sources.find((s) => s.id === coaId) || null;
@@ -66,30 +68,44 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
     return uniqueSorted(postings.data.map((r) => r[analyticsCol]));
   }, [postings, analyticsCol]);
 
-  const toggleAccount = (code) => {
-    setSelectedAccounts((prev) =>
-      prev.includes(code) ? prev.filter((c) => c !== code) : [...prev, code]
-    );
-  };
+  /** Common filters passed into every report builder. */
+  const buildFilters = useCallback(() => {
+    const analytics = [];
+    if (analyticsCol && analyticsValue) {
+      analytics.push({ column: analyticsCol, value: analyticsValue });
+    }
+    return {
+      organizationCol: orgCol || '',
+      organization: orgFilter || '',
+      analytics,
+    };
+  }, [orgCol, orgFilter, analyticsCol, analyticsValue]);
 
-  const run = () => {
+  const resolvedAccounts = useCallback(() => {
+    const fromChips = selectedAccounts || [];
+    const fromText = parseAccountList(accountFilter);
+    return [...new Set([...fromChips, ...fromText])];
+  }, [selectedAccounts, accountFilter]);
+
+  const run = useCallback(() => {
     setError('');
     setSuccess('');
     try {
       if (!postings) throw new Error('Выберите таблицу проводок из реестра');
       const coaLookup = coa ? buildCoaLookup(coa.data, coa.columns) : null;
-      const filters = {
-        organizationCol: orgCol,
-        organization: orgFilter || '',
-      };
+      const filters = buildFilters();
+      const accountsList = resolvedAccounts();
 
       let out;
       if (kind === 'osv' || kind === 'osv_filter') {
+        if (kind === 'osv_filter' && !accountsList.length) {
+          throw new Error('Выберите счета (чекбоксы) или введите список счетов');
+        }
         out = buildOsv({
           postings: postings.data,
           columns: postings.columns,
-          accountFilters: kind === 'osv_filter' ? selectedAccounts : null,
-          accountFilter: kind === 'osv_filter' ? accountFilter : '',
+          accountFilters: kind === 'osv_filter' ? accountsList : null,
+          accountFilter: '',
           dateFrom,
           dateTo,
           mapping: map,
@@ -98,10 +114,12 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
           filters,
         });
       } else if (kind === 'card') {
+        const account = accountFilter || accountsList[0] || '';
+        if (!account) throw new Error('Выберите счёт для карточки');
         out = buildAccountCard({
           postings: postings.data,
           columns: postings.columns,
-          account: accountFilter || selectedAccounts[0] || '',
+          account,
           dateFrom,
           dateTo,
           mapping: map,
@@ -110,10 +128,12 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
           analyticsValue,
         });
       } else if (kind === 'analysis') {
+        const account = accountFilter || accountsList[0] || '';
+        if (!account) throw new Error('Выберите счёт для анализа');
         out = buildAccountAnalysis({
           postings: postings.data,
           columns: postings.columns,
-          account: accountFilter || selectedAccounts[0] || '',
+          account,
           dateFrom,
           dateTo,
           mapping: map,
@@ -121,6 +141,7 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
           filters,
         });
       } else if (kind === 'subconto') {
+        if (!analyticsCol) throw new Error('Выберите колонку аналитики / вид субконто');
         out = buildSubcontoAnalysis({
           postings: postings.data,
           columns: postings.columns,
@@ -132,13 +153,62 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
           filters,
           groupByAccount,
         });
+      } else {
+        throw new Error('Неизвестный тип отчёта');
       }
+
       setResult({ kind, ...out });
       const n = out.data?.length ?? 0;
-      setSuccess(`Сформировано строк: ${n}`);
+      const skipped = out.skippedDates?.length || 0;
+      setSuccess(
+        `Сформировано строк: ${n}` +
+          (skipped ? ` · пропущено проводок с нераспознанной датой: ${skipped}` : '')
+      );
+      autoRun.current = true;
     } catch (err) {
       setError(err.message || String(err));
+      setResult(null);
     }
+  }, [
+    postings,
+    coa,
+    buildFilters,
+    resolvedAccounts,
+    kind,
+    dateFrom,
+    dateTo,
+    map,
+    analyticsCol,
+    analyticsValue,
+    subcontoSide,
+    groupByAccount,
+    accountFilter,
+  ]);
+
+  // Recalculate when any report parameter changes (after first successful run).
+  useEffect(() => {
+    if (!autoRun.current || !postingsId) return;
+    run();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    postingsId,
+    coaId,
+    kind,
+    dateFrom,
+    dateTo,
+    orgFilter,
+    accountFilter,
+    selectedAccounts,
+    analyticsCol,
+    analyticsValue,
+    subcontoSide,
+    groupByAccount,
+  ]);
+
+  const toggleAccount = (code) => {
+    setSelectedAccounts((prev) =>
+      prev.includes(code) ? prev.filter((c) => c !== code) : [...prev, code]
+    );
   };
 
   const exportData = () => {
@@ -159,8 +229,7 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
       exportToExcel(flat, 'Анализ_счёта.xlsx');
       return;
     }
-    const rows =
-      result.totals ? [...result.data, result.totals] : result.data;
+    const rows = result.totals ? [...result.data, result.totals] : result.data;
     exportToExcel(rows, `Отчёт_${result.kind}.xlsx`);
   };
 
@@ -169,8 +238,8 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
       <div>
         <h2 className="text-2xl font-black text-slate-800">Шаг 4. Стандартные отчёты 1С</h2>
         <p className="text-sm text-slate-500 font-medium mt-1">
-          ОСВ, карточка и анализ по журналу проводок из реестра. Входящее сальдо — проводки до периода;
-          обороты — внутри периода; исходящее = входящее + обороты.
+          ОСВ, карточка и анализ по журналу проводок из реестра. Входящее сальдо — проводки до
+          периода; обороты — внутри периода (включительно); исходящее = входящее + обороты.
         </p>
       </div>
 
@@ -189,7 +258,11 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
         <SourcePicker
           sources={sources}
           value={postingsId}
-          onChange={setPostingsId}
+          onChange={(id) => {
+            autoRun.current = false;
+            setPostingsId(id);
+            setResult(null);
+          }}
           label="Таблица проводок (из реестра)"
         />
         <SourcePicker
@@ -271,7 +344,7 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
         {kind === 'osv_filter' && (
           <div className="md:col-span-2">
             <label className="text-xs font-bold text-slate-500 mb-1 block">
-              Счета (мультивыбор) или префикс вручную
+              Счета (мультивыбор) и/или список через запятую
             </label>
             <input
               value={accountFilter}
@@ -301,10 +374,10 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
             </div>
           </div>
         )}
-        {(kind === 'analysis' || kind === 'card' || kind === 'subconto') && (
+        {(kind === 'analysis' || kind === 'card' || kind === 'subconto' || kind === 'osv' || kind === 'osv_filter') && (
           <div>
             <label className="text-xs font-bold text-slate-500 mb-1 block">
-              {kind === 'subconto' ? 'Вид субконто / колонка аналитики' : 'Аналитика (опц.)'}
+              {kind === 'subconto' ? 'Вид субконто / колонка аналитики' : 'Фильтр аналитики (опц.)'}
             </label>
             <select
               value={analyticsCol}
@@ -330,7 +403,7 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
             </select>
           </div>
         )}
-        {kind === 'card' && analyticsCol && (
+        {analyticsCol && kind !== 'subconto' && (
           <div>
             <label className="text-xs font-bold text-slate-500 mb-1 block">Значение аналитики</label>
             <select
@@ -387,7 +460,9 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
             <>
               <h3 className="font-bold text-slate-800 text-sm">Сводка по счёту</h3>
               <DataPreview data={result.data} columns={result.columns} maxRows={20} />
-              <h3 className="font-bold text-slate-800 text-sm">Разбивка оборотов по корреспонденции</h3>
+              <h3 className="font-bold text-slate-800 text-sm">
+                Разбивка оборотов по корреспонденции
+              </h3>
               <DataPreview
                 data={result.breakdown}
                 columns={result.breakdownColumns}

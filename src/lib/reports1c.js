@@ -1,12 +1,13 @@
 /**
  * Standard 1C-style reports over a registry postings table.
  *
- * Period rules:
- *   opening (dateFrom):  Дата < dateFrom
- *   turnover:            dateFrom <= Дата <= dateTo
- *   closing:             opening + turnover  (= all txs with Дата <= dateTo)
+ * Period rules (day keys YYYY-MM-DD via toDateKey):
+ *   opening:  txDayKey <  fromKey
+ *   turnover: fromKey <= txDayKey <= toKey   (whole days inclusive)
+ *   closing:  openingNet + turnoverDt - turnoverCt → splitBalance
  *
- * Per-account balance split: net = Dt − Ct; if net >= 0 → Dt side, else Ct side.
+ * Unrecognized dates are skipped when a period bound is set (not silently
+ * dumped into turnover).
  */
 import { cellText, columnsFromData, parseNumeric, roundMoney, toDateKey } from './parse.js';
 
@@ -44,6 +45,10 @@ export function normalizeAccountCode(code) {
     .join('.');
 }
 
+/**
+ * Exact account / sub-account match after normalization.
+ * «60» matches «60» and «60.01»; «6» does NOT match «60».
+ */
 export function accountMatchesFilter(code, filters) {
   if (!filters?.length) return true;
   const c = normalizeAccountCode(code);
@@ -110,13 +115,28 @@ function passesFilters(row, filters = {}) {
   return true;
 }
 
-function dateBucket(dateKey, dateFrom, dateTo) {
-  const from = dateFrom ? toDateKey(dateFrom) : null;
-  const to = dateTo ? toDateKey(dateTo) : null;
-  if (!dateKey) return 'turnover'; // keep undated in period turnover
-  if (from && dateKey < from) return 'opening';
-  if (to && dateKey > to) return 'after';
+/**
+ * Classify a posting day relative to [dateFrom; dateTo].
+ * @returns {'opening'|'turnover'|'after'|'skip'}
+ */
+export function dateBucket(dateKey, dateFrom, dateTo) {
+  const fromKey = dateFrom ? toDateKey(dateFrom) : null;
+  const toKey = dateTo ? toDateKey(dateTo) : null;
+  const periodSet = !!(fromKey || toKey);
+
+  if (!dateKey) {
+    // No recognizable date: never dump into turnover when a period is active
+    return periodSet ? 'skip' : 'turnover';
+  }
+
+  if (fromKey && dateKey < fromKey) return 'opening';
+  if (toKey && dateKey > toKey) return 'after';
+  // fromKey <= dateKey <= toKey (or unbounded side)
   return 'turnover';
+}
+
+function money(n) {
+  return roundMoney(parseNumeric(n));
 }
 
 /**
@@ -124,7 +144,8 @@ function dateBucket(dateKey, dateFrom, dateTo) {
  */
 function accumulateByAccount(postings, map, { dateFrom, dateTo, accountFilters, filters }) {
   const byKey = new Map();
-  const displayVotes = new Map(); // key → Map<code, count>
+  const displayVotes = new Map();
+  const skippedDates = [];
 
   const touch = (rawCode) => {
     const key = normalizeAccountCode(rawCode);
@@ -139,23 +160,28 @@ function accumulateByAccount(postings, map, { dateFrom, dateTo, accountFilters, 
 
   for (const row of postings || []) {
     if (!passesFilters(row, filters)) continue;
-    const sum = parseNumeric(row[map.amount]);
+    const sum = money(row[map.amount]);
     if (!sum) continue;
     const dtRaw = map.accountDt ? cellText(row, map.accountDt) : '';
     const ctRaw = map.accountCt ? cellText(row, map.accountCt) : '';
-    const dKey = map.date ? toDateKey(row[map.date]) : null;
+    const rawDate = map.date ? row[map.date] : null;
+    const dKey = map.date ? toDateKey(rawDate) : null;
     const bucketKind = dateBucket(dKey, dateFrom, dateTo);
     if (bucketKind === 'after') continue;
+    if (bucketKind === 'skip') {
+      skippedDates.push({ date: rawDate, amount: sum });
+      continue;
+    }
 
     const dtKey = dtRaw ? touch(dtRaw) : null;
     const ctKey = ctRaw ? touch(ctRaw) : null;
 
     if (bucketKind === 'opening') {
-      if (dtKey) byKey.get(dtKey).openNet += sum;
-      if (ctKey) byKey.get(ctKey).openNet -= sum;
+      if (dtKey) byKey.get(dtKey).openNet = roundMoney(byKey.get(dtKey).openNet + sum);
+      if (ctKey) byKey.get(ctKey).openNet = roundMoney(byKey.get(ctKey).openNet - sum);
     } else {
-      if (dtKey) byKey.get(dtKey).turnoverDt += sum;
-      if (ctKey) byKey.get(ctKey).turnoverCt += sum;
+      if (dtKey) byKey.get(dtKey).turnoverDt = roundMoney(byKey.get(dtKey).turnoverDt + sum);
+      if (ctKey) byKey.get(ctKey).turnoverCt = roundMoney(byKey.get(ctKey).turnoverCt + sum);
     }
   }
 
@@ -165,21 +191,25 @@ function accumulateByAccount(postings, map, { dateFrom, dateTo, accountFilters, 
     return [...votes.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'ru'))[0][0];
   };
 
-  return { byKey, pickDisplay };
+  return { byKey, pickDisplay, skippedDates };
 }
 
 function rowFromBucket(displayCode, name, bucket) {
-  const open = splitBalance(bucket.openNet);
-  const close = splitBalance(bucket.openNet + bucket.turnoverDt - bucket.turnoverCt);
+  const openingNet = roundMoney(bucket.openNet);
+  const turnoverDt = roundMoney(bucket.turnoverDt);
+  const turnoverCt = roundMoney(bucket.turnoverCt);
+  const closingNet = roundMoney(openingNet + turnoverDt - turnoverCt);
+  const open = splitBalance(openingNet);
+  const close = splitBalance(closingNet);
   return {
     Счет: displayCode,
     Наименование: name || '',
-    'Сальдо нач. Дт': roundMoney(open.dt),
-    'Сальдо нач. Кт': roundMoney(open.ct),
-    'Оборот Дт': roundMoney(bucket.turnoverDt),
-    'Оборот Кт': roundMoney(bucket.turnoverCt),
-    'Сальдо кон. Дт': roundMoney(close.dt),
-    'Сальдо кон. Кт': roundMoney(close.ct),
+    'Сальдо нач. Дт': open.dt,
+    'Сальдо нач. Кт': open.ct,
+    'Оборот Дт': turnoverDt,
+    'Оборот Кт': turnoverCt,
+    'Сальдо кон. Дт': close.dt,
+    'Сальдо кон. Кт': close.ct,
   };
 }
 
@@ -219,6 +249,14 @@ function sumOsvTotals(rows) {
   return t;
 }
 
+export function parseAccountList(text) {
+  if (!text) return [];
+  return String(text)
+    .split(/[,;\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 /**
  * ОСВ по всем / выбранным счетам.
  */
@@ -241,26 +279,21 @@ export function buildOsv({
   }
   if (!map.amount) throw new Error('Не найдена колонка суммы');
 
-  const multi =
-    accountFilters?.length
-      ? accountFilters
-      : accountFilter
-        ? String(accountFilter)
-            .split(/[,;\s]+/)
-            .map((s) => s.trim())
-            .filter(Boolean)
-        : null;
+  const fromList = Array.isArray(accountFilters) ? accountFilters.filter(Boolean) : [];
+  const fromText = parseAccountList(accountFilter);
+  const multi = [...new Set([...fromList, ...fromText])];
+  const accountFilterList = multi.length ? multi : null;
 
-  const { byKey, pickDisplay } = accumulateByAccount(postings, map, {
+  const { byKey, pickDisplay, skippedDates } = accumulateByAccount(postings, map, {
     dateFrom,
     dateTo,
-    accountFilters: multi,
+    accountFilters: accountFilterList,
     filters,
   });
 
   if (includeCoaAccounts && coaLookup) {
     for (const key of coaLookup.keys()) {
-      if (multi?.length && !accountMatchesFilter(key, multi)) continue;
+      if (accountFilterList?.length && !accountMatchesFilter(key, accountFilterList)) continue;
       if (!byKey.has(key)) byKey.set(key, emptyBucket());
     }
   }
@@ -281,7 +314,15 @@ export function buildOsv({
     columns: OSV_COLUMNS,
     data,
     totals: sumOsvTotals(data),
+    skippedDates,
   };
+}
+
+function formatSignedBalance(net) {
+  const { dt, ct } = splitBalance(net);
+  if (dt) return `${roundMoney(dt)} Дт`;
+  if (ct) return `${roundMoney(ct)} Кт`;
+  return '0';
 }
 
 /**
@@ -316,10 +357,11 @@ export function buildAccountCard({
   const analyticsCols = listAnalyticsColumns(cols);
   let openNet = 0;
   const periodRows = [];
+  const skippedDates = [];
 
   for (const row of postings || []) {
     if (!passesFilters(row, localFilters)) continue;
-    const sum = parseNumeric(row[map.amount]);
+    const sum = money(row[map.amount]);
     if (!sum) continue;
     const dt = map.accountDt ? cellText(row, map.accountDt) : '';
     const ct = map.accountCt ? cellText(row, map.accountCt) : '';
@@ -327,21 +369,27 @@ export function buildAccountCard({
     const isCt = accountMatchesFilter(ct, [account]);
     if (!isDt && !isCt) continue;
 
-    const dKey = map.date ? toDateKey(row[map.date]) : null;
+    const rawDate = map.date ? row[map.date] : null;
+    const dKey = map.date ? toDateKey(rawDate) : null;
     const kind = dateBucket(dKey, dateFrom, dateTo);
     if (kind === 'after') continue;
-
-    if (kind === 'opening') {
-      if (isDt) openNet += sum;
-      if (isCt) openNet -= sum;
+    if (kind === 'skip') {
+      skippedDates.push({ date: rawDate, amount: sum });
       continue;
     }
 
+    if (kind === 'opening') {
+      if (isDt) openNet = roundMoney(openNet + sum);
+      if (isCt) openNet = roundMoney(openNet - sum);
+      continue;
+    }
+
+    // turnover: corr = opposite side
     const debit = isDt ? sum : 0;
     const credit = isCt ? sum : 0;
     const corr = isDt ? ct : dt;
     const out = {
-      Дата: map.date ? (dKey || row[map.date]) : '',
+      Дата: dKey || '',
       Документ: map.document ? cellText(row, map.document) : '',
       Содержание: map.content ? cellText(row, map.content) : '',
       'Корр. счёт': corr,
@@ -357,6 +405,7 @@ export function buildAccountCard({
 
   periodRows.sort((a, b) => String(a._sort).localeCompare(String(b._sort)));
 
+  openNet = roundMoney(openNet);
   const open = splitBalance(openNet);
   let running = openNet;
   const data = [];
@@ -369,7 +418,6 @@ export function buildAccountCard({
     'Сумма Дт': open.dt || '',
     'Сумма Кт': open.ct || '',
     'Текущее сальдо': formatSignedBalance(openNet),
-    _kind: 'opening',
   });
 
   for (const r of periodRows) {
@@ -378,7 +426,6 @@ export function buildAccountCard({
     data.push({
       ...rest,
       'Текущее сальдо': formatSignedBalance(running),
-      _kind: 'tx',
     });
   }
 
@@ -391,7 +438,6 @@ export function buildAccountCard({
     'Сумма Дт': close.dt || '',
     'Сумма Кт': close.ct || '',
     'Текущее сальдо': formatSignedBalance(running),
-    _kind: 'closing',
   });
 
   const baseCols = [
@@ -407,17 +453,11 @@ export function buildAccountCard({
 
   return {
     columns: baseCols,
-    data: data.map(({ _kind, ...r }) => r),
+    data,
     opening: { net: openNet, ...open },
     closing: { net: running, ...close },
+    skippedDates,
   };
-}
-
-function formatSignedBalance(net) {
-  const { dt, ct } = splitBalance(net);
-  if (dt) return `${roundMoney(dt)} Дт`;
-  if (ct) return `${roundMoney(ct)} Кт`;
-  return '0';
 }
 
 /**
@@ -442,10 +482,11 @@ export function buildAccountAnalysis({
   let turnoverDt = 0;
   let turnoverCt = 0;
   const byCorr = new Map();
+  const skippedDates = [];
 
   for (const row of postings || []) {
     if (!passesFilters(row, filters)) continue;
-    const sum = parseNumeric(row[map.amount]);
+    const sum = money(row[map.amount]);
     if (!sum) continue;
     const dt = map.accountDt ? cellText(row, map.accountDt) : '';
     const ct = map.accountCt ? cellText(row, map.accountCt) : '';
@@ -453,18 +494,23 @@ export function buildAccountAnalysis({
     const isCt = accountMatchesFilter(ct, [account]);
     if (!isDt && !isCt) continue;
 
-    const dKey = map.date ? toDateKey(row[map.date]) : null;
+    const rawDate = map.date ? row[map.date] : null;
+    const dKey = map.date ? toDateKey(rawDate) : null;
     const kind = dateBucket(dKey, dateFrom, dateTo);
     if (kind === 'after') continue;
-
-    if (kind === 'opening') {
-      if (isDt) openNet += sum;
-      if (isCt) openNet -= sum;
+    if (kind === 'skip') {
+      skippedDates.push({ date: rawDate, amount: sum });
       continue;
     }
 
-    if (isDt) turnoverDt += sum;
-    if (isCt) turnoverCt += sum;
+    if (kind === 'opening') {
+      if (isDt) openNet = roundMoney(openNet + sum);
+      if (isCt) openNet = roundMoney(openNet - sum);
+      continue;
+    }
+
+    if (isDt) turnoverDt = roundMoney(turnoverDt + sum);
+    if (isCt) turnoverCt = roundMoney(turnoverCt + sum);
 
     const corr = isDt ? ct || '(без корреспонденции)' : dt || '(без корреспонденции)';
     const corrKey = normalizeAccountCode(corr) || corr;
@@ -479,22 +525,22 @@ export function buildAccountAnalysis({
       });
     }
     const b = byCorr.get(key);
-    if (isDt) b['Оборот Дт'] += sum;
-    if (isCt) b['Оборот Кт'] += sum;
+    if (isDt) b['Оборот Дт'] = roundMoney(b['Оборот Дт'] + sum);
+    if (isCt) b['Оборот Кт'] = roundMoney(b['Оборот Кт'] + sum);
   }
 
+  openNet = roundMoney(openNet);
+  turnoverDt = roundMoney(turnoverDt);
+  turnoverCt = roundMoney(turnoverCt);
   const open = splitBalance(openNet);
-  const closeNet = openNet + turnoverDt - turnoverCt;
+  const closeNet = roundMoney(openNet + turnoverDt - turnoverCt);
   const close = splitBalance(closeNet);
 
   const summary = [
-    {
-      Показатель: 'Сальдо нач. Дт',
-      Значение: open.dt,
-    },
+    { Показатель: 'Сальдо нач. Дт', Значение: open.dt },
     { Показатель: 'Сальдо нач. Кт', Значение: open.ct },
-    { Показатель: 'Оборот Дт', Значение: roundMoney(turnoverDt) },
-    { Показатель: 'Оборот Кт', Значение: roundMoney(turnoverCt) },
+    { Показатель: 'Оборот Дт', Значение: turnoverDt },
+    { Показатель: 'Оборот Кт', Значение: turnoverCt },
     { Показатель: 'Сальдо кон. Дт', Значение: close.dt },
     { Показатель: 'Сальдо кон. Кт', Значение: close.ct },
   ];
@@ -525,14 +571,15 @@ export function buildAccountAnalysis({
     breakdownColumns,
     opening: { net: openNet, ...open },
     closing: { net: closeNet, ...close },
-    turnoverDt: roundMoney(turnoverDt),
-    turnoverCt: roundMoney(turnoverCt),
+    turnoverDt,
+    turnoverCt,
+    skippedDates,
   };
 }
 
 /**
  * Анализ субконто — группировка по значению аналитики (+ счёт).
- * side: 'dt' | 'ct' | 'both' — which analytics columns / posting side to use.
+ * side: 'dt' | 'ct' | 'both'
  */
 export function buildSubcontoAnalysis({
   postings = [],
@@ -551,6 +598,7 @@ export function buildSubcontoAnalysis({
   if (!map.amount) throw new Error('Не найдена колонка суммы');
 
   const byKey = new Map();
+  const skippedDates = [];
   const ensure = (analytics, account) => {
     const key = `${analytics}|||${account}`;
     if (!byKey.has(key)) {
@@ -567,16 +615,21 @@ export function buildSubcontoAnalysis({
 
   for (const row of postings || []) {
     if (!passesFilters(row, filters)) continue;
-    const sum = parseNumeric(row[map.amount]);
+    const sum = money(row[map.amount]);
     if (!sum) continue;
     const analytics = cellText(row, analyticsCol);
     if (!analytics) continue;
 
     const dt = map.accountDt ? cellText(row, map.accountDt) : '';
     const ct = map.accountCt ? cellText(row, map.accountCt) : '';
-    const dKey = map.date ? toDateKey(row[map.date]) : null;
+    const rawDate = map.date ? row[map.date] : null;
+    const dKey = map.date ? toDateKey(rawDate) : null;
     const kind = dateBucket(dKey, dateFrom, dateTo);
     if (kind === 'after') continue;
+    if (kind === 'skip') {
+      skippedDates.push({ date: rawDate, amount: sum });
+      continue;
+    }
 
     const isDtCol = /^Дт:|Подразделение\s*Дт/i.test(analyticsCol);
     const isCtCol = /^Кт:|Подразделение\s*Кт/i.test(analyticsCol);
@@ -597,16 +650,27 @@ export function buildSubcontoAnalysis({
       groupByAccount ? normalizeAccountCode(raw) || raw || '(пусто)' : '';
 
     if (kind === 'opening') {
-      if (useDt && dt) ensure(analytics, accountForGroup(dt)).openNet += sum;
-      if (useCt && ct) ensure(analytics, accountForGroup(ct)).openNet -= sum;
+      if (useDt && dt) {
+        const b = ensure(analytics, accountForGroup(dt));
+        b.openNet = roundMoney(b.openNet + sum);
+      }
+      if (useCt && ct) {
+        const b = ensure(analytics, accountForGroup(ct));
+        b.openNet = roundMoney(b.openNet - sum);
+      }
       continue;
     }
 
-    if (useDt && dt) ensure(analytics, accountForGroup(dt)).turnoverDt += sum;
-    if (useCt && ct) ensure(analytics, accountForGroup(ct)).turnoverCt += sum;
+    if (useDt && dt) {
+      const b = ensure(analytics, accountForGroup(dt));
+      b.turnoverDt = roundMoney(b.turnoverDt + sum);
+    }
+    if (useCt && ct) {
+      const b = ensure(analytics, accountForGroup(ct));
+      b.turnoverCt = roundMoney(b.turnoverCt + sum);
+    }
   }
 
-  // Merge if not grouping by account
   let entries = Array.from(byKey.values());
   if (!groupByAccount) {
     const merged = new Map();
@@ -621,26 +685,30 @@ export function buildSubcontoAnalysis({
         });
       }
       const m = merged.get(e.Аналитика);
-      m.openNet += e.openNet;
-      m.turnoverDt += e.turnoverDt;
-      m.turnoverCt += e.turnoverCt;
+      m.openNet = roundMoney(m.openNet + e.openNet);
+      m.turnoverDt = roundMoney(m.turnoverDt + e.turnoverDt);
+      m.turnoverCt = roundMoney(m.turnoverCt + e.turnoverCt);
     }
     entries = Array.from(merged.values());
   }
 
   const data = entries
     .map((e) => {
-      const open = splitBalance(e.openNet);
-      const close = splitBalance(e.openNet + e.turnoverDt - e.turnoverCt);
+      const openingNet = roundMoney(e.openNet);
+      const turnoverDt = roundMoney(e.turnoverDt);
+      const turnoverCt = roundMoney(e.turnoverCt);
+      const closingNet = roundMoney(openingNet + turnoverDt - turnoverCt);
+      const open = splitBalance(openingNet);
+      const close = splitBalance(closingNet);
       return {
         Аналитика: e.Аналитика,
         ...(groupByAccount ? { Счет: e.Счет } : {}),
-        'Сальдо нач. Дт': roundMoney(open.dt),
-        'Сальдо нач. Кт': roundMoney(open.ct),
-        'Оборот Дт': roundMoney(e.turnoverDt),
-        'Оборот Кт': roundMoney(e.turnoverCt),
-        'Сальдо кон. Дт': roundMoney(close.dt),
-        'Сальдо кон. Кт': roundMoney(close.ct),
+        'Сальдо нач. Дт': open.dt,
+        'Сальдо нач. Кт': open.ct,
+        'Оборот Дт': turnoverDt,
+        'Оборот Кт': turnoverCt,
+        'Сальдо кон. Дт': close.dt,
+        'Сальдо кон. Кт': close.ct,
       };
     })
     .sort(
@@ -670,7 +738,12 @@ export function buildSubcontoAnalysis({
         'Сальдо кон. Кт',
       ];
 
-  return { columns: outColumns, data, totals: sumOsvLike(data, outColumns) };
+  return {
+    columns: outColumns,
+    data,
+    totals: sumOsvLike(data, outColumns),
+    skippedDates,
+  };
 }
 
 function sumOsvLike(rows, columns) {
