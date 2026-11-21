@@ -1,13 +1,13 @@
 /**
  * Standard 1C-style reports over a registry postings table.
  *
- * Period rules (day keys YYYY-MM-DD via toDateKey):
+ * Period rules (day keys YYYY-MM-DD via toDateKey from parse.js — never raw Date()):
  *   opening:  txDayKey <  fromKey
  *   turnover: fromKey <= txDayKey <= toKey   (whole days inclusive)
  *   closing:  openingNet + turnoverDt - turnoverCt → splitBalance
  *
  * Unrecognized dates are skipped when a period bound is set (not silently
- * dumped into turnover).
+ * dumped into turnover). Callers can surface skippedDates via formatSkippedDates.
  */
 import { cellText, columnsFromData, parseNumeric, roundMoney, toDateKey } from './parse.js';
 
@@ -48,6 +48,7 @@ export function normalizeAccountCode(code) {
 /**
  * Exact account / sub-account match after normalization.
  * «60» matches «60» and «60.01»; «6» does NOT match «60».
+ * No loose startsWith(f) prefix match.
  */
 export function accountMatchesFilter(code, filters) {
   if (!filters?.length) return true;
@@ -74,6 +75,23 @@ export function listAnalyticsColumns(columns = []) {
   return (columns || []).filter((c) =>
     /^Дт:\s|^Кт:\s|Подразделение|Контрагент|Договор|Номенклатур|Стать/i.test(String(c))
   );
+}
+
+/** Human-readable skipped-date samples for UI diagnostics. */
+export function formatSkippedDates(skippedDates = [], limit = 5) {
+  if (!skippedDates?.length) return '';
+  const samples = skippedDates.slice(0, limit).map((s) => {
+    const raw = s?.date;
+    const shown =
+      raw == null || raw === ''
+        ? '(пусто)'
+        : typeof raw === 'object'
+          ? String(raw)
+          : String(raw);
+    return shown;
+  });
+  const more = skippedDates.length > limit ? ` …и ещё ${skippedDates.length - limit}` : '';
+  return `примеры: ${samples.join(' | ')}${more}`;
 }
 
 /** Build CoA lookup: normalized code → { displayCode, name }. */
@@ -103,11 +121,17 @@ function resolveMapping(columns, mapping) {
   return { ...detectPostingColumns(columns), ...mapping };
 }
 
-function passesFilters(row, filters = {}) {
+function passesOrgFilter(row, filters = {}) {
   if (filters.organization && filters.organizationCol) {
     const v = cellText(row, filters.organizationCol);
     if (v !== String(filters.organization).trim()) return false;
   }
+  return true;
+}
+
+/** Org + generic analytics filters (used by OSV / subconto). */
+function passesFilters(row, filters = {}) {
+  if (!passesOrgFilter(row, filters)) return false;
   for (const f of filters.analytics || []) {
     if (!f.column || f.value == null || f.value === '') continue;
     if (cellText(row, f.column) !== String(f.value).trim()) return false;
@@ -115,8 +139,110 @@ function passesFilters(row, filters = {}) {
   return true;
 }
 
+function isDtAnalyticsCol(col) {
+  return /^Дт:\s|Подразделение\s*Дт/i.test(String(col || ''));
+}
+
+function isCtAnalyticsCol(col) {
+  return /^Кт:\s|Подразделение\s*Кт/i.test(String(col || ''));
+}
+
+/** Extract type name from «Дт: Контрагенты» / «Кт: Контрагенты». */
+function analyticsTypeName(col) {
+  const s = String(col || '');
+  const m = s.match(/^[ДдKkКк][тt]:\s*(.+)$/i);
+  if (m) return m[1].trim();
+  const div = s.match(/^Подразделение\s*([ДдKkКк][тt])$/i);
+  if (div) return 'Подразделение';
+  return s.trim();
+}
+
+/** Find paired Дт/Кт analytics column in the table. */
+export function findPairedAnalyticsCol(col, columns = []) {
+  if (!col) return '';
+  const cols = columns || [];
+  if (isDtAnalyticsCol(col)) {
+    const type = analyticsTypeName(col);
+    if (/подразделение/i.test(col)) {
+      return cols.find((c) => /^Подразделение\s*Кт$/i.test(c)) || '';
+    }
+    return (
+      cols.find((c) => isCtAnalyticsCol(c) && analyticsTypeName(c) === type) || ''
+    );
+  }
+  if (isCtAnalyticsCol(col)) {
+    const type = analyticsTypeName(col);
+    if (/подразделение/i.test(col)) {
+      return cols.find((c) => /^Подразделение\s*Дт$/i.test(c)) || '';
+    }
+    return (
+      cols.find((c) => isDtAnalyticsCol(c) && analyticsTypeName(c) === type) || ''
+    );
+  }
+  return '';
+}
+
 /**
- * Classify a posting day relative to [dateFrom; dateTo].
+ * For card/analysis: analytics must match on the side where the selected account sits.
+ * If user picked «Дт: X» but account is on Ct, check paired «Кт: X» (and vice versa).
+ */
+export function analyticsMatchesAccountSide(
+  row,
+  { analyticsCol, analyticsValue, isDt, isCt, columns }
+) {
+  if (!analyticsCol || analyticsValue == null || analyticsValue === '') return true;
+  const want = String(analyticsValue).trim();
+  const paired = findPairedAnalyticsCol(analyticsCol, columns);
+
+  const check = (col) => col && cellText(row, col) === want;
+
+  if (isDtAnalyticsCol(analyticsCol)) {
+    if (isDt && check(analyticsCol)) return true;
+    if (isCt && paired && check(paired)) return true;
+    // Account on both sides of same posting (rare): either side ok
+    if (isDt && isCt) return check(analyticsCol) || (paired && check(paired));
+    return false;
+  }
+  if (isCtAnalyticsCol(analyticsCol)) {
+    if (isCt && check(analyticsCol)) return true;
+    if (isDt && paired && check(paired)) return true;
+    if (isDt && isCt) return check(analyticsCol) || (paired && check(paired));
+    return false;
+  }
+  // Unsidded column: plain equality
+  return check(analyticsCol);
+}
+
+/**
+ * Resolve which analytics columns to read for Dt / Ct given side + selected column.
+ * When side=both and «Дт: Контрагенты» is selected, also uses paired «Кт: Контрагенты».
+ */
+export function resolveSubcontoSideColumns(analyticsCol, side, columns = []) {
+  const paired = findPairedAnalyticsCol(analyticsCol, columns);
+  const wantDt = side === 'dt' || side === 'both';
+  const wantCt = side === 'ct' || side === 'both';
+
+  if (isDtAnalyticsCol(analyticsCol)) {
+    return {
+      dtCol: wantDt ? analyticsCol : null,
+      ctCol: wantCt && paired ? paired : null,
+    };
+  }
+  if (isCtAnalyticsCol(analyticsCol)) {
+    return {
+      dtCol: wantDt && paired ? paired : null,
+      ctCol: wantCt ? analyticsCol : null,
+    };
+  }
+  // Unsidded: same column on both sides (subject to side flag)
+  return {
+    dtCol: wantDt ? analyticsCol : null,
+    ctCol: wantCt ? analyticsCol : null,
+  };
+}
+
+/**
+ * Classify a posting day relative to [dateFrom; dateTo] using toDateKey only.
  * @returns {'opening'|'turnover'|'after'|'skip'}
  */
 export function dateBucket(dateKey, dateFrom, dateTo) {
@@ -125,13 +251,11 @@ export function dateBucket(dateKey, dateFrom, dateTo) {
   const periodSet = !!(fromKey || toKey);
 
   if (!dateKey) {
-    // No recognizable date: never dump into turnover when a period is active
     return periodSet ? 'skip' : 'turnover';
   }
 
   if (fromKey && dateKey < fromKey) return 'opening';
   if (toKey && dateKey > toKey) return 'after';
-  // fromKey <= dateKey <= toKey (or unbounded side)
   return 'turnover';
 }
 
@@ -281,7 +405,7 @@ export function buildOsv({
 
   const fromList = Array.isArray(accountFilters) ? accountFilters.filter(Boolean) : [];
   const fromText = parseAccountList(accountFilter);
-  const multi = [...new Set([...fromList, ...fromText])];
+  const multi = [...new Set([...fromList, ...fromText].map((a) => String(a).trim()).filter(Boolean))];
   const accountFilterList = multi.length ? multi : null;
 
   const { byKey, pickDisplay, skippedDates } = accumulateByAccount(postings, map, {
@@ -327,6 +451,8 @@ function formatSignedBalance(net) {
 
 /**
  * Карточка счёта — входящий остаток, журнал за период, исходящий остаток.
+ * Account matched via normalizeAccountCode (60.1 ≡ 60.01).
+ * Analytics filter checked on the side where the selected account sits.
  */
 export function buildAccountCard({
   postings = [],
@@ -340,19 +466,24 @@ export function buildAccountCard({
   analyticsValue = '',
 }) {
   if (!account) throw new Error('Укажите счёт для карточки');
+  const accountNorm = normalizeAccountCode(account);
+  if (!accountNorm) throw new Error('Укажите счёт для карточки');
+
   const cols = columns?.length ? columns : columnsFromData(postings);
   const map = resolveMapping(cols, mapping);
   if (!map.amount) throw new Error('Не найдена колонка суммы');
 
-  const localFilters = {
-    ...filters,
-    analytics: [
-      ...(filters.analytics || []),
-      ...(analyticsCol && analyticsValue
-        ? [{ column: analyticsCol, value: analyticsValue }]
-        : []),
-    ],
+  // Org from filters; analytics handled side-aware below (not via passesFilters).
+  const orgOnly = {
+    organizationCol: filters.organizationCol || '',
+    organization: filters.organization || '',
   };
+  const analyticsFromFilters = (filters.analytics || []).filter(
+    (f) => f.column && f.value != null && f.value !== ''
+  );
+  const effectiveAnalyticsCol = analyticsCol || analyticsFromFilters[0]?.column || '';
+  const effectiveAnalyticsValue =
+    analyticsValue || analyticsFromFilters[0]?.value || '';
 
   const analyticsCols = listAnalyticsColumns(cols);
   let openNet = 0;
@@ -360,14 +491,26 @@ export function buildAccountCard({
   const skippedDates = [];
 
   for (const row of postings || []) {
-    if (!passesFilters(row, localFilters)) continue;
+    if (!passesOrgFilter(row, orgOnly)) continue;
     const sum = money(row[map.amount]);
     if (!sum) continue;
     const dt = map.accountDt ? cellText(row, map.accountDt) : '';
     const ct = map.accountCt ? cellText(row, map.accountCt) : '';
-    const isDt = accountMatchesFilter(dt, [account]);
-    const isCt = accountMatchesFilter(ct, [account]);
+    const isDt = accountMatchesFilter(dt, [accountNorm]);
+    const isCt = accountMatchesFilter(ct, [accountNorm]);
     if (!isDt && !isCt) continue;
+
+    if (
+      !analyticsMatchesAccountSide(row, {
+        analyticsCol: effectiveAnalyticsCol,
+        analyticsValue: effectiveAnalyticsValue,
+        isDt,
+        isCt,
+        columns: cols,
+      })
+    ) {
+      continue;
+    }
 
     const rawDate = map.date ? row[map.date] : null;
     const dKey = map.date ? toDateKey(rawDate) : null;
@@ -384,7 +527,6 @@ export function buildAccountCard({
       continue;
     }
 
-    // turnover: corr = opposite side
     const debit = isDt ? sum : 0;
     const credit = isCt ? sum : 0;
     const corr = isDt ? ct : dt;
@@ -471,12 +613,29 @@ export function buildAccountAnalysis({
   dateTo = '',
   mapping,
   analyticsCol = '',
+  analyticsValue = '',
   filters = {},
 }) {
   if (!account) throw new Error('Укажите счёт для анализа');
+  const accountNorm = normalizeAccountCode(account);
+  if (!accountNorm) throw new Error('Укажите счёт для анализа');
+
   const cols = columns?.length ? columns : columnsFromData(postings);
   const map = resolveMapping(cols, mapping);
   if (!map.amount) throw new Error('Не найдена колонка суммы');
+
+  const orgOnly = {
+    organizationCol: filters.organizationCol || '',
+    organization: filters.organization || '',
+  };
+  const analyticsFromFilters = (filters.analytics || []).filter(
+    (f) => f.column && f.value != null && f.value !== ''
+  );
+  const effectiveAnalyticsCol = analyticsCol || analyticsFromFilters[0]?.column || '';
+  const effectiveAnalyticsValue =
+    analyticsValue || analyticsFromFilters[0]?.value || '';
+  // Breakdown dimension (optional): group by analyticsCol even without a value filter
+  const breakdownAnalyticsCol = analyticsCol || '';
 
   let openNet = 0;
   let turnoverDt = 0;
@@ -485,14 +644,26 @@ export function buildAccountAnalysis({
   const skippedDates = [];
 
   for (const row of postings || []) {
-    if (!passesFilters(row, filters)) continue;
+    if (!passesOrgFilter(row, orgOnly)) continue;
     const sum = money(row[map.amount]);
     if (!sum) continue;
     const dt = map.accountDt ? cellText(row, map.accountDt) : '';
     const ct = map.accountCt ? cellText(row, map.accountCt) : '';
-    const isDt = accountMatchesFilter(dt, [account]);
-    const isCt = accountMatchesFilter(ct, [account]);
+    const isDt = accountMatchesFilter(dt, [accountNorm]);
+    const isCt = accountMatchesFilter(ct, [accountNorm]);
     if (!isDt && !isCt) continue;
+
+    if (
+      !analyticsMatchesAccountSide(row, {
+        analyticsCol: effectiveAnalyticsCol,
+        analyticsValue: effectiveAnalyticsValue,
+        isDt,
+        isCt,
+        columns: cols,
+      })
+    ) {
+      continue;
+    }
 
     const rawDate = map.date ? row[map.date] : null;
     const dKey = map.date ? toDateKey(rawDate) : null;
@@ -514,8 +685,10 @@ export function buildAccountAnalysis({
 
     const corr = isDt ? ct || '(без корреспонденции)' : dt || '(без корреспонденции)';
     const corrKey = normalizeAccountCode(corr) || corr;
-    const analytics = analyticsCol ? cellText(row, analyticsCol) || '(пусто)' : '';
-    const key = analyticsCol ? `${corrKey}|||${analytics}` : corrKey;
+    const analytics = breakdownAnalyticsCol
+      ? cellText(row, breakdownAnalyticsCol) || '(пусто)'
+      : '';
+    const key = breakdownAnalyticsCol ? `${corrKey}|||${analytics}` : corrKey;
     if (!byCorr.has(key)) {
       byCorr.set(key, {
         'Корр. счёт': corr || corrKey,
@@ -559,7 +732,7 @@ export function buildAccountAnalysis({
       )
     );
 
-  const breakdownColumns = analyticsCol
+  const breakdownColumns = breakdownAnalyticsCol
     ? ['Корр. счёт', 'Аналитика', 'Оборот Дт', 'Оборот Кт']
     : ['Корр. счёт', 'Оборот Дт', 'Оборот Кт'];
 
@@ -580,6 +753,7 @@ export function buildAccountAnalysis({
 /**
  * Анализ субконто — группировка по значению аналитики (+ счёт).
  * side: 'dt' | 'ct' | 'both'
+ * Paired Дт:/Кт: columns are resolved when side=both.
  */
 export function buildSubcontoAnalysis({
   postings = [],
@@ -597,6 +771,11 @@ export function buildSubcontoAnalysis({
   const map = resolveMapping(cols, mapping);
   if (!map.amount) throw new Error('Не найдена колонка суммы');
 
+  const { dtCol, ctCol } = resolveSubcontoSideColumns(analyticsCol, side, cols);
+  if (!dtCol && !ctCol) {
+    throw new Error('Нет колонок аналитики для выбранной стороны (Дт/Кт)');
+  }
+
   const byKey = new Map();
   const skippedDates = [];
   const ensure = (analytics, account) => {
@@ -613,12 +792,13 @@ export function buildSubcontoAnalysis({
     return byKey.get(key);
   };
 
+  const accountForGroup = (raw) =>
+    groupByAccount ? normalizeAccountCode(raw) || raw || '(пусто)' : '';
+
   for (const row of postings || []) {
     if (!passesFilters(row, filters)) continue;
     const sum = money(row[map.amount]);
     if (!sum) continue;
-    const analytics = cellText(row, analyticsCol);
-    if (!analytics) continue;
 
     const dt = map.accountDt ? cellText(row, map.accountDt) : '';
     const ct = map.accountCt ? cellText(row, map.accountCt) : '';
@@ -631,42 +811,27 @@ export function buildSubcontoAnalysis({
       continue;
     }
 
-    const isDtCol = /^Дт:|Подразделение\s*Дт/i.test(analyticsCol);
-    const isCtCol = /^Кт:|Подразделение\s*Кт/i.test(analyticsCol);
-    let useDt = false;
-    let useCt = false;
-    if (isDtCol) {
-      if (side === 'ct') continue;
-      useDt = true;
-    } else if (isCtCol) {
-      if (side === 'dt') continue;
-      useCt = true;
-    } else {
-      useDt = side === 'dt' || side === 'both';
-      useCt = side === 'ct' || side === 'both';
-    }
-
-    const accountForGroup = (raw) =>
-      groupByAccount ? normalizeAccountCode(raw) || raw || '(пусто)' : '';
+    const dtAnalytics = dtCol ? cellText(row, dtCol) : '';
+    const ctAnalytics = ctCol ? cellText(row, ctCol) : '';
 
     if (kind === 'opening') {
-      if (useDt && dt) {
-        const b = ensure(analytics, accountForGroup(dt));
+      if (dtCol && dt && dtAnalytics) {
+        const b = ensure(dtAnalytics, accountForGroup(dt));
         b.openNet = roundMoney(b.openNet + sum);
       }
-      if (useCt && ct) {
-        const b = ensure(analytics, accountForGroup(ct));
+      if (ctCol && ct && ctAnalytics) {
+        const b = ensure(ctAnalytics, accountForGroup(ct));
         b.openNet = roundMoney(b.openNet - sum);
       }
       continue;
     }
 
-    if (useDt && dt) {
-      const b = ensure(analytics, accountForGroup(dt));
+    if (dtCol && dt && dtAnalytics) {
+      const b = ensure(dtAnalytics, accountForGroup(dt));
       b.turnoverDt = roundMoney(b.turnoverDt + sum);
     }
-    if (useCt && ct) {
-      const b = ensure(analytics, accountForGroup(ct));
+    if (ctCol && ct && ctAnalytics) {
+      const b = ensure(ctAnalytics, accountForGroup(ct));
       b.turnoverCt = roundMoney(b.turnoverCt + sum);
     }
   }

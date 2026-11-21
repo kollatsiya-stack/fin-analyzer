@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { Play } from 'lucide-react';
 import DataPreview from './DataPreview.jsx';
 import SourcePicker from './SourcePicker.jsx';
@@ -9,6 +9,7 @@ import {
   buildOsv,
   buildSubcontoAnalysis,
   detectPostingColumns,
+  formatSkippedDates,
   listAccountsInPostings,
   listAnalyticsColumns,
   parseAccountList,
@@ -41,7 +42,6 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
   const [subcontoSide, setSubcontoSide] = useState('both');
   const [groupByAccount, setGroupByAccount] = useState(true);
   const [result, setResult] = useState(null);
-  const autoRun = useRef(false);
 
   const postings = sources.find((s) => s.id === postingsId) || null;
   const coa = sources.find((s) => s.id === coaId) || null;
@@ -86,6 +86,13 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
     const fromText = parseAccountList(accountFilter);
     return [...new Set([...fromChips, ...fromText])];
   }, [selectedAccounts, accountFilter]);
+
+  const changeKind = (next) => {
+    setKind(next);
+    setError('');
+    setSuccess('');
+    // Do not wipe result here — user may compare; new Form replaces it.
+  };
 
   const run = useCallback(() => {
     setError('');
@@ -138,6 +145,7 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
           dateTo,
           mapping: map,
           analyticsCol,
+          analyticsValue,
           filters,
         });
       } else if (kind === 'subconto') {
@@ -160,14 +168,16 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
       setResult({ kind, ...out });
       const n = out.data?.length ?? 0;
       const skipped = out.skippedDates?.length || 0;
+      const samples = skipped ? formatSkippedDates(out.skippedDates, 5) : '';
       setSuccess(
         `Сформировано строк: ${n}` +
-          (skipped ? ` · пропущено проводок с нераспознанной датой: ${skipped}` : '')
+          (skipped
+            ? ` · пропущено проводок с нераспознанной датой: ${skipped}${samples ? ` (${samples})` : ''}`
+            : '')
       );
-      autoRun.current = true;
     } catch (err) {
       setError(err.message || String(err));
-      setResult(null);
+      // Keep previous result on error so a bad filter tweak does not wipe the table.
     }
   }, [
     postings,
@@ -183,26 +193,6 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
     subcontoSide,
     groupByAccount,
     accountFilter,
-  ]);
-
-  // Recalculate when any report parameter changes (after first successful run).
-  useEffect(() => {
-    if (!autoRun.current || !postingsId) return;
-    run();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    postingsId,
-    coaId,
-    kind,
-    dateFrom,
-    dateTo,
-    orgFilter,
-    accountFilter,
-    selectedAccounts,
-    analyticsCol,
-    analyticsValue,
-    subcontoSide,
-    groupByAccount,
   ]);
 
   const toggleAccount = (code) => {
@@ -240,6 +230,7 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
         <p className="text-sm text-slate-500 font-medium mt-1">
           ОСВ, карточка и анализ по журналу проводок из реестра. Входящее сальдо — проводки до
           периода; обороты — внутри периода (включительно); исходящее = входящее + обороты.
+          Пересчёт только по кнопке «Сформировать».
         </p>
       </div>
 
@@ -249,7 +240,7 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
         </div>
       )}
       {success && (
-        <div className="p-3 bg-green-50 text-green-700 rounded-xl border border-green-200 font-bold text-sm">
+        <div className="p-3 bg-green-50 text-green-700 rounded-xl border border-green-200 font-bold text-sm whitespace-pre-wrap">
           {success}
         </div>
       )}
@@ -259,9 +250,10 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
           sources={sources}
           value={postingsId}
           onChange={(id) => {
-            autoRun.current = false;
             setPostingsId(id);
             setResult(null);
+            setError('');
+            setSuccess('');
           }}
           label="Таблица проводок (из реестра)"
         />
@@ -279,7 +271,7 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
           <label className="text-xs font-bold text-slate-500 mb-1 block">Тип отчёта</label>
           <select
             value={kind}
-            onChange={(e) => setKind(e.target.value)}
+            onChange={(e) => changeKind(e.target.value)}
             className="w-full border-slate-300 rounded-lg p-2 text-sm font-bold bg-white"
           >
             {REPORT_KINDS.map((k) => (
@@ -374,7 +366,11 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
             </div>
           </div>
         )}
-        {(kind === 'analysis' || kind === 'card' || kind === 'subconto' || kind === 'osv' || kind === 'osv_filter') && (
+        {(kind === 'analysis' ||
+          kind === 'card' ||
+          kind === 'subconto' ||
+          kind === 'osv' ||
+          kind === 'osv_filter') && (
           <div>
             <label className="text-xs font-bold text-slate-500 mb-1 block">
               {kind === 'subconto' ? 'Вид субконто / колонка аналитики' : 'Фильтр аналитики (опц.)'}
@@ -456,6 +452,12 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
 
       {result && (
         <div className="space-y-4">
+          {result.kind !== kind && (
+            <div className="p-2 bg-amber-50 text-amber-800 rounded-lg border border-amber-200 text-xs font-bold">
+              Показан предыдущий отчёт ({REPORT_KINDS.find((k) => k.id === result.kind)?.label || result.kind}).
+              Нажмите «Сформировать», чтобы пересчитать для текущего типа.
+            </div>
+          )}
           {result.kind === 'analysis' && (
             <>
               <h3 className="font-bold text-slate-800 text-sm">Сводка по счёту</h3>
