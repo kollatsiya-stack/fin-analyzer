@@ -1,62 +1,65 @@
 import { describe, expect, it } from 'vitest';
+import { normalizeJournal } from './doubleEntry.js';
 import {
-  excelFormulaToRowTotal,
-  importStructureFromRows,
+  defaultCellRule,
+  drillDownFromCell,
   makeReportTemplate,
   runUniversalReport,
+  setCellRule,
 } from './reportBuilder.js';
-import { makeArgument, makeFormulaTemplate } from './formulas.js';
-import { makeSource } from './sources.js';
 
-describe('importStructureFromRows', () => {
-  it('builds hierarchy from dotted codes', () => {
-    const structure = importStructureFromRows([
-      { Код: '01', Имя: 'Выручка' },
-      { Код: '01.01', Имя: 'ВГО' },
-    ]);
-    expect(structure.rows[1].level).toBe(1);
-  });
-});
+const raw = [
+  { Дата: '2024-05-01', 'Счет Дт': '51', 'Счет Кт': '62', Сумма: 1000, Организация: 'Альфа' },
+  { Дата: '2024-05-02', 'Счет Дт': '51', 'Счет Кт': '62', Сумма: 500, Организация: 'Альфа' },
+  { Дата: '2024-05-03', 'Счет Дт': '60', 'Счет Кт': '51', Сумма: 200, Организация: 'Бета' },
+];
 
-describe('excelFormulaToRowTotal', () => {
-  it('maps cell refs to row numbers', () => {
-    expect(excelFormulaToRowTotal('=B5+B6*0.87')).toBe('[5]+[6]*0.87');
-  });
-});
-
-describe('runUniversalReport', () => {
-  it('computes formula and row-total cells', () => {
-    const source = makeSource({
-      id: 's1',
-      name: 'Base',
-      data: [{ Сумма: 100 }, { Сумма: 50 }],
-    });
-    const formula = makeFormulaTemplate({
-      id: 'f1',
-      config: {
-        arguments: [makeArgument({ id: 'a1', sourceId: 's1', resourceCol: 'Сумма' })],
-        expression: { type: 'compound', items: [{ type: 'argument', ref: 'a1' }] },
-      },
-    });
-    const template = makeReportTemplate({
+describe('runUniversalReport pivot', () => {
+  it('fills cells from double-entry and drill-down matches', () => {
+    const { transactions } = normalizeJournal(raw);
+    let tpl = makeReportTemplate({ name: 'ДС' });
+    const rowId = tpl.structure.rows[0].id;
+    const colId = tpl.structure.columns[0].id;
+    tpl = {
+      ...tpl,
       structure: {
-        rows: [
-          { number: 1, code: '01', name: 'Выручка', level: 0, type: 'calculation' },
-          { number: 2, code: '02', name: 'Итого', level: 0, type: 'total' },
+        ...tpl.structure,
+        rows: [{ id: rowId, name: 'Счёт 51', accounts: ['51'], expandBy: '', level: 0 }],
+        columns: [
+          {
+            id: colId,
+            name: 'Май',
+            startDate: '2024-05-01',
+            endDate: '2024-05-31',
+            filters: [],
+          },
         ],
-        columns: [{ code: 'VAL', name: 'Значение', type: 'static' }],
-        cellRules: {
-          'row:1,col:VAL': { type: 'formula', formulaId: 'f1' },
-          'row:2,col:VAL': { type: 'rowTotal', expression: '[1]*2' },
+        rules: {
+          [rowId]: {
+            [colId]: defaultCellRule({ metricType: 'active_balance' }),
+          },
         },
       },
-    });
-    const result = runUniversalReport({
-      template,
-      sources: [source],
-      formulas: [formula],
-    });
-    expect(result.rows[0]['VAL::base']).toBe(150);
-    expect(result.rows[1]['VAL::base']).toBe(300);
+    };
+
+    const result = runUniversalReport({ template: tpl, transactions });
+    expect(result.rows).toHaveLength(1);
+    const val = result.rows[0].values[colId];
+    expect(val).toBe(1300); // 1500 dr - 200 cr
+
+    const ctx = result.cells[`${result.rows[0].id}|${colId}`];
+    expect(ctx.drillable).toBe(true);
+    const dd = drillDownFromCell(transactions, ctx);
+    expect(dd.blocked).toBe(false);
+    expect(dd.total).toBe(val);
+    expect(dd.transactions.length).toBe(3);
+  });
+
+  it('setCellRule updates nested map', () => {
+    const tpl = makeReportTemplate();
+    const rowId = tpl.structure.rows[0].id;
+    const colId = tpl.structure.columns[0].id;
+    const next = setCellRule(tpl.structure, rowId, colId, { metricType: 'credit' });
+    expect(next.rules[rowId][colId].metricType).toBe('credit');
   });
 });

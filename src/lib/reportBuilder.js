@@ -1,29 +1,56 @@
 /**
- * Report templates + universal report runner (client-side).
+ * Pivot report: Row (accounts) × Column (period + filters) → double-entry cell.
+ * Formula cells supported; drill-down only for type === 'db'.
  */
+import {
+  buildDrillDown,
+  calculateDoubleEntrySum,
+  defaultCellRule,
+  getFilteredTransactions,
+} from './doubleEntry.js';
 import { evaluateFormula } from './formulas.js';
-import { parseNumeric, roundMoney } from './parse.js';
+import { cellText, roundMoney } from './parse.js';
 
 export function createTemplateId() {
   return `tpl_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 }
 
+export function createRowId() {
+  return `row_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+export function createColId() {
+  return `col_${Math.random().toString(36).slice(2, 8)}`;
+}
+
 export function emptyReportStructure() {
+  const rowId = createRowId();
+  const colId = createColId();
   return {
     rows: [
       {
-        number: 1,
-        code: '01',
-        name: 'Показатель 1',
+        id: rowId,
+        name: 'Денежные средства',
+        accounts: ['50', '51'],
+        expandBy: '',
         level: 0,
-        type: 'calculation',
-        zone: '',
-        sign: '+',
-        hidden: false,
       },
     ],
-    columns: [{ code: 'VAL', name: 'Значение', type: 'static', format: 'number', decimals: 2 }],
-    cellRules: {},
+    columns: [
+      {
+        id: colId,
+        name: 'Период',
+        startDate: '',
+        endDate: '',
+        filters: [],
+      },
+    ],
+    /** rules[rowId][colId] = cell rule */
+    rules: {
+      [rowId]: {
+        [colId]: defaultCellRule({ metricType: 'active_balance' }),
+      },
+    },
   };
 }
 
@@ -48,19 +75,215 @@ export function makeReportTemplate({
   };
 }
 
-function cellKey(rowNumber, colCode) {
-  return `row:${rowNumber},col:${colCode}`;
+export function getCellRule(structure, rowId, colId) {
+  return structure?.rules?.[rowId]?.[colId] || defaultCellRule();
 }
 
-function evalRowTotalExpression(expr, rowValues, colCode) {
-  // Supports [n] references and + - * / constants
+export function setCellRule(structure, rowId, colId, rule) {
+  const rules = { ...(structure.rules || {}) };
+  rules[rowId] = { ...(rules[rowId] || {}), [colId]: { ...defaultCellRule(), ...rule } };
+  return { ...structure, rules };
+}
+
+/**
+ * Build expanded display rows (parent + analytic children when expandBy set).
+ */
+function expandRowNodes(row, transactions, columns, structure) {
+  const nodes = [{ row, pathObj: null, isChild: false }];
+  if (!row.expandBy) return nodes;
+
+  const values = new Set();
+  for (const col of columns) {
+    const rule = getCellRule(structure, row.id, col.id);
+    if (rule.type === 'formula') continue;
+    const filtered = getFilteredTransactions(
+      transactions,
+      { accounts: row.accounts },
+      col,
+      null,
+      { ...rule, expandAnalytic: rule.expandAnalytic || 'debit' }
+    );
+    for (const tx of filtered) {
+      const v = cellText(tx, row.expandBy);
+      if (v) values.add(v);
+    }
+  }
+  const sorted = Array.from(values).sort((a, b) => a.localeCompare(b, 'ru'));
+  for (const v of sorted) {
+    nodes.push({
+      row: {
+        ...row,
+        id: `${row.id}::${v}`,
+        name: v,
+        level: (row.level || 0) + 1,
+        parentId: row.id,
+      },
+      pathObj: { [row.expandBy]: v },
+      isChild: true,
+      parentRowId: row.id,
+    });
+  }
+  return nodes;
+}
+
+function evalFormulaCell(rule, sources, formulas) {
+  if (!rule.formulaId) return null;
+  const fml = (formulas || []).find((f) => f.id === rule.formulaId && !f.isDeleted);
+  if (!fml) throw new Error('Формула не найдена');
+  return evaluateFormula(fml.config, sources, formulas).value;
+}
+
+/**
+ * Run pivot report over normalized transactions.
+ * @returns matrix rows with cell values + contexts for drill-down
+ */
+export function runUniversalReport({
+  template,
+  transactions = [],
+  sources = [],
+  formulas = [],
+  globalStartDate = '',
+  globalEndDate = '',
+}) {
+  if (!template?.structure) throw new Error('Не выбран шаблон отчёта');
+  const { rows, columns, rules } = template.structure;
+  const errors = [];
+  const displayRows = [];
+  const cells = {}; // key `${displayRowId}|${colId}` -> { value, context }
+
+  for (const baseRow of rows || []) {
+    const nodes = expandRowNodes(baseRow, transactions, columns || [], template.structure);
+    for (const node of nodes) {
+      const display = {
+        id: node.row.id,
+        name: node.row.name,
+        level: node.row.level || 0,
+        accounts: baseRow.accounts,
+        pathObj: node.pathObj,
+        parentRowId: node.parentRowId || baseRow.id,
+        isChild: node.isChild,
+        values: {},
+      };
+
+      for (const col of columns || []) {
+        const rule = getCellRule(template.structure, baseRow.id, col.id);
+        const colParams = {
+          startDate: col.startDate || globalStartDate,
+          endDate: col.endDate || globalEndDate,
+          filters: col.filters || [],
+        };
+        const rowParams = { accounts: baseRow.accounts || [] };
+        let value = null;
+        try {
+          if (rule.type === 'formula') {
+            value = evalFormulaCell(rule, sources, formulas);
+          } else if (rule.type === 'constant') {
+            value = Number(rule.value) || 0;
+          } else {
+            value = calculateDoubleEntrySum(
+              transactions,
+              rowParams,
+              colParams,
+              node.pathObj,
+              rule
+            );
+          }
+        } catch (err) {
+          errors.push({ row: display.name, col: col.name, message: err.message });
+          value = null;
+        }
+        display.values[col.id] = value;
+        cells[`${display.id}|${col.id}`] = {
+          value,
+          rule,
+          rowParams,
+          colParams,
+          pathObj: node.pathObj,
+          rowName: node.isChild ? `${baseRow.name} › ${display.name}` : display.name,
+          colName: col.name,
+          baseRowId: baseRow.id,
+          colId: col.id,
+          drillable: rule.type === 'db' && value != null,
+        };
+      }
+      displayRows.push(display);
+    }
+  }
+
+  return {
+    columns: columns || [],
+    rows: displayRows,
+    cells,
+    errors,
+    rules,
+  };
+}
+
+/** Open drill-down for a cell context. */
+export function drillDownFromCell(transactions, cellCtx) {
+  if (!cellCtx) return null;
+  if (!cellCtx.drillable || cellCtx.rule?.type === 'formula') {
+    return buildDrillDown(transactions, cellCtx.rowParams, cellCtx.colParams, cellCtx.pathObj, {
+      type: 'formula',
+    }, { rowName: cellCtx.rowName, colName: cellCtx.colName });
+  }
+  return buildDrillDown(
+    transactions,
+    cellCtx.rowParams,
+    cellCtx.colParams,
+    cellCtx.pathObj,
+    cellCtx.rule,
+    { rowName: cellCtx.rowName, colName: cellCtx.colName }
+  );
+}
+
+/**
+ * Import report structure from Excel-like rows (code + name → accounts from name heuristics).
+ */
+export function importStructureFromRows(rows, { codeCol, nameCol, accountsCol, start = 0 } = {}) {
+  if (!rows?.length) return emptyReportStructure();
+  const keys = Object.keys(rows[0]);
+  const cCol = codeCol || keys[0];
+  const nCol = nameCol || keys[1] || keys[0];
+  const aCol = accountsCol || keys.find((k) => /счет/i.test(k)) || keys[2];
+  const slice = rows.slice(start);
+  const structure = emptyReportStructure();
+  const colId = structure.columns[0].id;
+  structure.rows = slice.map((r) => {
+    const id = createRowId();
+    const accountsRaw = aCol ? String(r[aCol] ?? '') : '';
+    const accounts = accountsRaw
+      .split(/[,;\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    return {
+      id,
+      name: String(r[nCol] ?? r[cCol] ?? '').trim() || 'Показатель',
+      accounts: accounts.length ? accounts : ['51'],
+      expandBy: '',
+      level: 0,
+    };
+  });
+  structure.rules = {};
+  for (const row of structure.rows) {
+    structure.rules[row.id] = { [colId]: defaultCellRule({ metricType: 'active_balance' }) };
+  }
+  return structure;
+}
+
+export function excelFormulaToRowTotal(formula) {
+  const f = String(formula || '').trim().replace(/^=/, '');
+  return f.replace(/[A-Za-z]+(\d+)/g, (_, row) => `[${row}]`);
+}
+
+/** Legacy helper kept for older tests / formula grids — sums referenced cells. */
+export function evalRowTotalExpression(expr, rowValues, colCode) {
   const tokens = String(expr || '')
     .replace(/\[(\d+)\]/g, (_, n) => ` ${rowValues[`${n}:${colCode}`] ?? 0} `)
     .replace(/([+\-*/()])/g, ' $1 ')
     .trim()
     .split(/\s+/)
     .filter(Boolean);
-
   const output = [];
   const ops = [];
   const precedence = { '+': 1, '-': 1, '*': 2, '/': 2 };
@@ -73,7 +296,6 @@ function evalRowTotalExpression(expr, rowValues, colCode) {
     else if (op === '*') output.push(a * b);
     else if (op === '/') output.push(b === 0 ? 0 : a / b);
   };
-
   for (const t of tokens) {
     if (/^-?\d+(\.\d+)?$/.test(t)) output.push(parseFloat(t));
     else if (t === '(') ops.push(t);
@@ -93,154 +315,6 @@ function evalRowTotalExpression(expr, rowValues, colCode) {
   }
   while (ops.length) apply();
   return roundMoney(output[0] ?? 0);
-}
-
-/**
- * Run universal report for a template.
- * @returns {{ columns, rows, matrix, drilldown, errors }}
- */
-export function runUniversalReport({
-  template,
-  sources,
-  formulas = [],
-  periodLabel = '',
-  comparePeriods = [],
-}) {
-  if (!template?.structure) throw new Error('Не выбран шаблон отчёта');
-  const { rows, columns, cellRules } = template.structure;
-  const periods = [{ id: 'base', label: periodLabel || 'Период' }, ...comparePeriods];
-  const outColumns = ['code', 'name', ...periods.flatMap((p) => columns.map((c) => `${c.code}::${p.id}`))];
-  const matrix = []; // display rows
-  const drilldown = {}; // key -> source rows
-  const errors = [];
-  const rowValues = {}; // `${rowNumber}:${colCode}` -> number (base period)
-
-  // First pass: formula / constant cells for base period
-  for (const row of rows || []) {
-    if (row.hidden) continue;
-    const display = { code: row.code, name: row.name, level: row.level || 0, type: row.type };
-    for (const col of columns || []) {
-      const key = cellKey(row.number, col.code);
-      const rule = cellRules?.[key] || { type: 'empty' };
-      let value = null;
-      try {
-        if (rule.type === 'constant') {
-          value = parseNumeric(rule.value);
-        } else if (rule.type === 'formula') {
-          const fml = formulas.find((f) => f.id === rule.formulaId && !f.isDeleted);
-          if (!fml) throw new Error(`Формула не найдена`);
-          const result = evaluateFormula(fml.config, sources, formulas);
-          value = result.value;
-          drilldown[`${row.number}:${col.code}`] = {
-            type: 'formula',
-            formulaId: fml.id,
-            arguments: result.arguments,
-          };
-        } else if (rule.type === 'empty') {
-          value = null;
-        }
-        // rowTotal / colTotal handled in second pass
-      } catch (err) {
-        errors.push({ row: row.number, col: col.code, message: err.message });
-        value = null;
-      }
-      if (rule.type === 'formula' || rule.type === 'constant') {
-        rowValues[`${row.number}:${col.code}`] = value ?? 0;
-        display[`${col.code}::base`] = value;
-      }
-    }
-    matrix.push(display);
-  }
-
-  // Second pass: row totals
-  for (const row of rows || []) {
-    if (row.hidden) continue;
-    const display = matrix.find((m) => m.code === row.code && m.name === row.name) || null;
-    if (!display) continue;
-    for (const col of columns || []) {
-      const key = cellKey(row.number, col.code);
-      const rule = cellRules?.[key];
-      if (rule?.type !== 'rowTotal') continue;
-      try {
-        const value = evalRowTotalExpression(rule.expression, rowValues, col.code);
-        rowValues[`${row.number}:${col.code}`] = value;
-        display[`${col.code}::base`] = value;
-      } catch (err) {
-        errors.push({ row: row.number, col: col.code, message: err.message });
-      }
-    }
-  }
-
-  // Column totals (SUM down calculation rows for each col)
-  for (const col of columns || []) {
-    for (const row of rows || []) {
-      const key = cellKey(row.number, col.code);
-      const rule = cellRules?.[key];
-      if (rule?.type !== 'colTotal') continue;
-      const display = matrix.find((m) => m.code === row.code);
-      if (!display) continue;
-      const sum = (rows || [])
-        .filter((r) => r.type === 'calculation' && !r.hidden)
-        .reduce((s, r) => s + (rowValues[`${r.number}:${col.code}`] || 0), 0);
-      const value = roundMoney(sum);
-      rowValues[`${row.number}:${col.code}`] = value;
-      display[`${col.code}::base`] = value;
-    }
-  }
-
-  return {
-    columns: outColumns,
-    columnHeaders: [
-      { key: 'code', label: 'Код' },
-      { key: 'name', label: 'Показатель' },
-      ...periods.flatMap((p) =>
-        columns.map((c) => ({
-          key: `${c.code}::${p.id}`,
-          label: periods.length > 1 ? `${c.name} (${p.label})` : c.name,
-        }))
-      ),
-    ],
-    rows: matrix,
-    drilldown,
-    errors,
-  };
-}
-
-/**
- * Import report structure from Excel-like rows (code + name columns).
- */
-export function importStructureFromRows(rows, { codeCol, nameCol, start = 0 } = {}) {
-  if (!rows?.length) return emptyReportStructure();
-  const keys = Object.keys(rows[0]);
-  const cCol = codeCol || keys[0];
-  const nCol = nameCol || keys[1] || keys[0];
-  const slice = rows.slice(start);
-  const structure = emptyReportStructure();
-  structure.rows = slice.map((r, i) => {
-    const code = String(r[cCol] ?? '').trim() || String(i + 1);
-    const level = Math.max(0, (code.match(/\./g) || []).length);
-    return {
-      number: i + 1,
-      code,
-      name: String(r[nCol] ?? '').trim() || `Строка ${i + 1}`,
-      level,
-      type: 'calculation',
-      zone: '',
-      sign: '+',
-      hidden: false,
-    };
-  });
-  structure.cellRules = {};
-  return structure;
-}
-
-/**
- * Parse simple Excel formula text into rowTotal expression using row numbers by column letter map.
- * Limited: =B5+B6 → [5]+[6] when B maps to current column semantics (row refs only).
- */
-export function excelFormulaToRowTotal(formula) {
-  const f = String(formula || '').trim().replace(/^=/, '');
-  return f.replace(/[A-Za-z]+(\d+)/g, (_, row) => `[${row}]`);
 }
 
 const TPL_STORAGE = 'turbohub_report_templates_v1';
@@ -287,3 +361,6 @@ export function saveReportSettings(list) {
   if (typeof localStorage === 'undefined') return;
   localStorage.setItem(SETTINGS_STORAGE, JSON.stringify(list || []));
 }
+
+// Re-export for callers that only import reportBuilder
+export { defaultCellRule };

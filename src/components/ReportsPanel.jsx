@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import DataPreview from './DataPreview.jsx';
 import SourcePicker from './SourcePicker.jsx';
+import DrillDownModal from './DrillDownModal.jsx';
 import {
   buildAccountAnalysis,
   buildAccountCard,
@@ -18,6 +19,7 @@ import {
   detectPostingColumns,
   listAnalyticsColumns,
 } from '../lib/reports1c.js';
+import { normalizeJournal } from '../lib/doubleEntry.js';
 import {
   emptyFormulaConfig,
   evaluateFormula,
@@ -28,27 +30,49 @@ import {
   upsertFormula,
 } from '../lib/formulas.js';
 import {
+  createColId,
+  createRowId,
+  defaultCellRule,
+  drillDownFromCell,
   emptyReportStructure,
-  excelFormulaToRowTotal,
+  getCellRule,
   importStructureFromRows,
   loadTemplatesFromStorage,
   makeReportTemplate,
   runUniversalReport,
   saveTemplatesToStorage,
+  setCellRule,
   upsertTemplate,
 } from '../lib/reportBuilder.js';
 import { exportToExcel, readFileAsWorkbook } from '../lib/excel.js';
-import { columnsFromData } from '../lib/parse.js';
 
 const TABS = [
   { id: 'std', label: 'Стандартные отчёты 1С', icon: FileSpreadsheet },
   { id: 'formulas', label: 'Шаблоны формул', icon: Calculator },
   { id: 'templates', label: 'Шаблоны отчётов', icon: Layers },
-  { id: 'universal', label: 'Универсальный отчёт', icon: Play },
+  { id: 'universal', label: 'Сводный отчёт', icon: Play },
 ];
 
+const METRIC_OPTS = [
+  ['debit', 'Оборот Дт'],
+  ['credit', 'Оборот Кт'],
+  ['active_balance', 'Активное сальдо (Дт−Кт)'],
+  ['passive_balance', 'Пассивное сальдо (Кт−Дт)'],
+];
+
+const INDICATOR_OPTS = [
+  ['turnover', 'Обороты за период'],
+  ['start_balance', 'Остаток на начало'],
+  ['end_balance', 'Остаток на конец'],
+];
+
+function fmt(n) {
+  if (n == null || n === '' || Number.isNaN(n)) return '—';
+  return Number(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
 export default function ReportsPanel({ sources = [], onRegisterResult }) {
-  const [tab, setTab] = useState('std');
+  const [tab, setTab] = useState('universal');
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
 
@@ -77,15 +101,27 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
   const [editingFormula, setEditingFormula] = useState(null);
   const [formulaTest, setFormulaTest] = useState(null);
 
-  // --- Templates ---
+  // --- Templates (pivot) ---
   const [templates, setTemplates] = useState(() => loadTemplatesFromStorage());
   const [editingTpl, setEditingTpl] = useState(null);
 
-  // --- Universal ---
+  // --- Pivot / Universal ---
+  const [uniSourceId, setUniSourceId] = useState(null);
   const [uniTplId, setUniTplId] = useState(null);
-  const [uniPeriod, setUniPeriod] = useState('');
+  const [uniGlobalFrom, setUniGlobalFrom] = useState('');
+  const [uniGlobalTo, setUniGlobalTo] = useState('');
   const [uniResult, setUniResult] = useState(null);
-  const [uniDrill, setUniDrill] = useState(null);
+  const [uniTx, setUniTx] = useState([]);
+  const [drill, setDrill] = useState(null);
+
+  const uniSource = sources.find((s) => s.id === uniSourceId) || null;
+  const filterFieldOptions = useMemo(() => {
+    if (!uniSource) return [];
+    const skip = new Set(
+      Object.values(detectPostingColumns(uniSource.columns || [])).filter(Boolean)
+    );
+    return (uniSource.columns || []).filter((c) => !skip.has(c));
+  }, [uniSource]);
 
   const persistFormulas = (next) => {
     setFormulas(next);
@@ -154,10 +190,7 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
         config: {
           ...emptyFormulaConfig(),
           arguments: [makeArgument({ name: 'Аргумент 1' })],
-          expression: {
-            type: 'compound',
-            items: [{ type: 'argument', ref: '' }],
-          },
+          expression: { type: 'compound', items: [{ type: 'argument', ref: '' }] },
         },
       })
     );
@@ -166,15 +199,13 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
 
   const saveFormula = () => {
     if (!editingFormula?.name) return;
-    // Fix expression arg refs if single arg
     const cfg = editingFormula.config;
     if (cfg.arguments?.length === 1 && cfg.expression?.items?.length) {
       cfg.expression.items = cfg.expression.items.map((it) =>
         it.type === 'argument' && !it.ref ? { ...it, ref: cfg.arguments[0].id } : it
       );
     }
-    const next = upsertFormula(formulas, { ...editingFormula, config: cfg });
-    persistFormulas(next);
+    persistFormulas(upsertFormula(formulas, { ...editingFormula, config: cfg }));
     setSuccess(`Формула «${editingFormula.name}» сохранена`);
     setEditingFormula(null);
   };
@@ -196,8 +227,7 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
 
   const saveTemplate = () => {
     if (!editingTpl?.name) return;
-    const next = upsertTemplate(templates, editingTpl);
-    persistTemplates(next);
+    persistTemplates(upsertTemplate(templates, editingTpl));
     setSuccess(`Шаблон «${editingTpl.name}» сохранён`);
     setEditingTpl(null);
   };
@@ -207,28 +237,35 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
     try {
       const parsed = await readFileAsWorkbook(file);
       const structure = importStructureFromRows(parsed.data);
-      setEditingTpl({ ...editingTpl, structure: { ...editingTpl.structure, rows: structure.rows } });
+      setEditingTpl({ ...editingTpl, structure });
       setSuccess(`Импортировано строк: ${structure.rows.length}`);
     } catch (err) {
       setError(err.message);
     }
   };
 
-  const runUniversal = () => {
+  const patchTpl = (fn) => setEditingTpl((prev) => ({ ...prev, structure: fn(prev.structure) }));
+
+  const runPivot = () => {
     setError('');
-    setUniDrill(null);
+    setDrill(null);
     try {
+      if (!uniSource) throw new Error('Выберите журнал проводок из реестра');
       const tpl = templates.find((t) => t.id === uniTplId);
       if (!tpl) throw new Error('Выберите шаблон отчёта');
+      const { transactions } = normalizeJournal(uniSource.data, uniSource.columns);
+      setUniTx(transactions);
       const result = runUniversalReport({
         template: tpl,
+        transactions,
         sources,
         formulas,
-        periodLabel: uniPeriod || 'Период',
+        globalStartDate: uniGlobalFrom,
+        globalEndDate: uniGlobalTo,
       });
       setUniResult(result);
       setSuccess(
-        `Отчёт сформирован: ${result.rows.length} строк` +
+        `Отчёт: ${result.rows.length} строк × ${result.columns.length} столбцов` +
           (result.errors.length ? `, ошибок: ${result.errors.length}` : '')
       );
     } catch (err) {
@@ -236,32 +273,35 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
     }
   };
 
-  const updateArg = (argId, patch) => {
-    setEditingFormula((prev) => ({
-      ...prev,
-      config: {
-        ...prev.config,
-        arguments: prev.config.arguments.map((a) => (a.id === argId ? { ...a, ...patch } : a)),
-      },
-    }));
+  const openDrill = (displayRow, col) => {
+    if (!uniResult) return;
+    const ctx = uniResult.cells[`${displayRow.id}|${col.id}`];
+    if (!ctx) return;
+    if (ctx.rule?.type === 'formula') {
+      setDrill(
+        drillDownFromCell(uniTx, { ...ctx, drillable: false })
+      );
+      return;
+    }
+    const payload = drillDownFromCell(uniTx, ctx);
+    // Prove kopeck match
+    if (payload && !payload.blocked && ctx.value != null && payload.total !== ctx.value) {
+      setError(
+        `Расхождение drill-down: ячейка ${fmt(ctx.value)} ≠ детализация ${fmt(payload.total)}`
+      );
+    }
+    setDrill(payload);
   };
 
-  const setCellRule = (rowNumber, colCode, rule) => {
-    setEditingTpl((prev) => {
-      const key = `row:${rowNumber},col:${colCode}`;
-      const cellRules = { ...prev.structure.cellRules };
-      if (!rule || rule.type === 'empty') delete cellRules[key];
-      else cellRules[key] = rule;
-      return { ...prev, structure: { ...prev.structure, cellRules } };
-    });
-  };
+  const editingRuleFor = (rowId, colId) =>
+    editingTpl ? getCellRule(editingTpl.structure, rowId, colId) : defaultCellRule();
 
   return (
     <div className="space-y-6">
       <div>
         <h2 className="text-2xl font-black text-slate-800">Шаг 4. Отчёты</h2>
         <p className="text-sm text-slate-500 font-medium mt-1">
-          Стандартные отчёты 1С и конструктор: формулы → шаблоны → универсальный отчёт. Источники — только из реестра.
+          Сводный отчёт: ячейка = строка (счета) × столбец (период/фильтры). Клик — расшифровка до проводок.
         </p>
       </div>
 
@@ -292,20 +332,11 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
       {/* ===== Standard 1C ===== */}
       {tab === 'std' && (
         <div className="space-y-4">
-          <SourcePicker
-            sources={sources}
-            value={stdSourceId}
-            onChange={setStdSourceId}
-            label="Таблица проводок (из реестра)"
-          />
+          <SourcePicker sources={sources} value={stdSourceId} onChange={setStdSourceId} label="Таблица проводок (из реестра)" />
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
             <div>
               <label className="text-xs font-bold text-slate-500 mb-1 block">Тип отчёта</label>
-              <select
-                value={stdKind}
-                onChange={(e) => setStdKind(e.target.value)}
-                className="w-full border-slate-300 rounded-lg p-2 text-sm font-bold bg-white"
-              >
+              <select value={stdKind} onChange={(e) => setStdKind(e.target.value)} className="w-full border-slate-300 rounded-lg p-2 text-sm font-bold bg-white">
                 <option value="osv">ОСВ по всем счетам</option>
                 <option value="osv_filter">ОСВ по выбранным счетам</option>
                 <option value="card">Карточка счёта</option>
@@ -313,40 +344,25 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
                 <option value="subconto">Анализ субконто</option>
               </select>
             </div>
-            {(stdKind !== 'osv' || stdKind === 'osv_filter') && stdKind !== 'subconto' && (
+            {stdKind !== 'osv' && stdKind !== 'subconto' && (
               <div>
                 <label className="text-xs font-bold text-slate-500 mb-1 block">Счёт (префикс)</label>
-                <input
-                  value={stdAccount}
-                  onChange={(e) => setStdAccount(e.target.value)}
-                  placeholder="41 или 41.01"
-                  className="w-full border-slate-300 rounded-lg p-2 text-sm font-bold"
-                />
+                <input value={stdAccount} onChange={(e) => setStdAccount(e.target.value)} placeholder="41 или 41.01" className="w-full border-slate-300 rounded-lg p-2 text-sm font-bold" />
               </div>
             )}
             {(stdKind === 'analysis' || stdKind === 'subconto') && (
               <div>
                 <label className="text-xs font-bold text-slate-500 mb-1 block">Колонка аналитики</label>
-                <select
-                  value={stdAnalyticsCol}
-                  onChange={(e) => setStdAnalyticsCol(e.target.value)}
-                  className="w-full border-slate-300 rounded-lg p-2 text-sm bg-white font-bold"
-                >
+                <select value={stdAnalyticsCol} onChange={(e) => setStdAnalyticsCol(e.target.value)} className="w-full border-slate-300 rounded-lg p-2 text-sm bg-white font-bold">
                   <option value="">—</option>
-                  {analyticsCols.map((c) => (
-                    <option key={c} value={c}>{c}</option>
-                  ))}
+                  {analyticsCols.map((c) => <option key={c} value={c}>{c}</option>)}
                 </select>
               </div>
             )}
             {stdKind === 'subconto' && (
               <div>
                 <label className="text-xs font-bold text-slate-500 mb-1 block">Сторона</label>
-                <select
-                  value={stdSide}
-                  onChange={(e) => setStdSide(e.target.value)}
-                  className="w-full border-slate-300 rounded-lg p-2 text-sm bg-white font-bold"
-                >
+                <select value={stdSide} onChange={(e) => setStdSide(e.target.value)} className="w-full border-slate-300 rounded-lg p-2 text-sm bg-white font-bold">
                   <option value="dt">Дебет</option>
                   <option value="ct">Кредит</option>
                 </select>
@@ -366,36 +382,11 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
           </button>
           {stdResult && (
             <div className="space-y-3">
-              <DataPreview
-                data={
-                  stdResult.totals
-                    ? [...stdResult.data, stdResult.totals]
-                    : stdResult.data
-                }
-                columns={stdResult.columns}
-                maxRows={100}
-              />
+              <DataPreview data={stdResult.totals ? [...stdResult.data, stdResult.totals] : stdResult.data} columns={stdResult.columns} maxRows={100} />
               <div className="flex gap-2">
-                <button
-                  type="button"
-                  onClick={() => exportToExcel(stdResult.totals ? [...stdResult.data, stdResult.totals] : stdResult.data, 'OSV.xlsx')}
-                  className="bg-green-600 text-white px-4 py-2 rounded-lg font-bold text-sm"
-                >
-                  Excel
-                </button>
+                <button type="button" onClick={() => exportToExcel(stdResult.totals ? [...stdResult.data, stdResult.totals] : stdResult.data, 'OSV.xlsx')} className="bg-green-600 text-white px-4 py-2 rounded-lg font-bold text-sm">Excel</button>
                 {onRegisterResult && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      onRegisterResult(
-                        stdResult.totals ? [...stdResult.data, stdResult.totals] : stdResult.data,
-                        `Отчёт_${stdKind}`
-                      )
-                    }
-                    className="bg-slate-800 text-white px-4 py-2 rounded-lg font-bold text-sm"
-                  >
-                    В реестр
-                  </button>
+                  <button type="button" onClick={() => onRegisterResult(stdResult.totals ? [...stdResult.data, stdResult.totals] : stdResult.data, `Отчёт_${stdKind}`)} className="bg-slate-800 text-white px-4 py-2 rounded-lg font-bold text-sm">В реестр</button>
                 )}
               </div>
             </div>
@@ -403,7 +394,7 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
         </div>
       )}
 
-      {/* ===== Formulas ===== */}
+      {/* ===== Formulas (kept for formula cells) ===== */}
       {tab === 'formulas' && (
         <div className="space-y-4">
           {!editingFormula ? (
@@ -411,462 +402,482 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
               <button type="button" onClick={startNewFormula} className="bg-indigo-600 text-white px-4 py-2 rounded-lg font-bold text-sm inline-flex items-center gap-2">
                 <Plus className="w-4 h-4" /> Новая формула
               </button>
-              <div className="border border-slate-200 rounded-xl divide-y">
-                {formulas.filter((f) => !f.isDeleted).length === 0 && (
-                  <p className="p-4 text-sm text-slate-500 font-medium">Справочник пуст</p>
-                )}
+              <ul className="divide-y divide-slate-100 border border-slate-200 rounded-xl">
                 {formulas.filter((f) => !f.isDeleted).map((f) => (
-                  <div key={f.id} className="p-3 flex items-center justify-between gap-3">
+                  <li key={f.id} className="p-3 flex justify-between gap-2">
                     <div>
-                      <div className="font-bold text-sm text-slate-800">{f.name}</div>
-                      <div className="text-xs text-slate-500">{f.group} · v{f.version} · аргументов: {f.config?.arguments?.length || 0}</div>
+                      <div className="font-bold text-sm">{f.name}</div>
+                      <div className="text-xs text-slate-500">{f.group}</div>
                     </div>
-                    <div className="flex gap-2">
-                      <button type="button" onClick={() => { setEditingFormula(JSON.parse(JSON.stringify(f))); setFormulaTest(null); }} className="text-xs font-bold px-3 py-1.5 rounded-lg bg-slate-100">Изменить</button>
-                      <button type="button" onClick={() => persistFormulas(formulas.map((x) => x.id === f.id ? { ...x, isDeleted: true } : x))} className="text-slate-400 hover:text-red-500"><Trash2 className="w-4 h-4" /></button>
-                    </div>
-                  </div>
+                    <button type="button" onClick={() => setEditingFormula(f)} className="text-xs font-bold px-3 py-1.5 bg-slate-100 rounded-lg">Изменить</button>
+                  </li>
                 ))}
-              </div>
+                {!formulas.filter((f) => !f.isDeleted).length && (
+                  <li className="p-4 text-sm text-slate-500">Нет формул. Нужны только для ячеек type=formula.</li>
+                )}
+              </ul>
             </>
           ) : (
-            <div className="space-y-4 bg-slate-50 border border-slate-200 rounded-xl p-4">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <div>
-                  <label className="text-xs font-bold text-slate-500 mb-1 block">Наименование</label>
-                  <input value={editingFormula.name} onChange={(e) => setEditingFormula({ ...editingFormula, name: e.target.value })} className="w-full border-slate-300 rounded p-2 text-sm font-bold" />
-                </div>
-                <div>
-                  <label className="text-xs font-bold text-slate-500 mb-1 block">Группа</label>
-                  <input value={editingFormula.group} onChange={(e) => setEditingFormula({ ...editingFormula, group: e.target.value })} className="w-full border-slate-300 rounded p-2 text-sm" />
-                </div>
-              </div>
-
-              <h4 className="font-bold text-slate-800 text-sm">Аргументы</h4>
-              {(editingFormula.config.arguments || []).map((arg) => {
-                const src = sources.find((s) => s.id === arg.sourceId);
-                return (
-                  <div key={arg.id} className="bg-white border border-slate-200 rounded-xl p-3 space-y-2">
-                    <input value={arg.name} onChange={(e) => updateArg(arg.id, { name: e.target.value })} className="w-full border-slate-300 rounded p-2 text-sm font-bold" placeholder="Имя аргумента" />
-                    <SourcePicker sources={sources} value={arg.sourceId} onChange={(id) => updateArg(arg.id, { sourceId: id })} label="Таблица из реестра" />
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-                      <div>
-                        <label className="text-xs font-bold text-slate-500 mb-1 block">Ресурс</label>
-                        <select value={arg.resourceCol} onChange={(e) => updateArg(arg.id, { resourceCol: e.target.value })} className="w-full border-slate-300 rounded p-2 text-sm bg-white">
-                          <option value="">—</option>
-                          {(src?.columns || []).map((c) => <option key={c} value={c}>{c}</option>)}
-                        </select>
-                      </div>
-                      <div>
-                        <label className="text-xs font-bold text-slate-500 mb-1 block">Агрегат</label>
-                        <select value={arg.aggregation} onChange={(e) => updateArg(arg.id, { aggregation: e.target.value })} className="w-full border-slate-300 rounded p-2 text-sm bg-white">
-                          {['SUM', 'AVG', 'COUNT', 'MIN', 'MAX'].map((a) => <option key={a} value={a}>{a}</option>)}
-                        </select>
-                      </div>
-                      <div>
-                        <label className="text-xs font-bold text-slate-500 mb-1 block">Развёртка по</label>
-                        <select value={arg.expandBy || ''} onChange={(e) => updateArg(arg.id, { expandBy: e.target.value })} className="w-full border-slate-300 rounded p-2 text-sm bg-white">
-                          <option value="">—</option>
-                          {(src?.columns || []).map((c) => <option key={c} value={c}>{c}</option>)}
-                        </select>
-                      </div>
-                    </div>
-                    <label className="flex items-center gap-2 text-sm font-medium">
-                      <input type="checkbox" checked={!!arg.useNegative} onChange={(e) => updateArg(arg.id, { useNegative: e.target.checked })} />
-                      Использовать отрицательное
-                    </label>
-                    <div className="space-y-2">
-                      <div className="flex items-center justify-between">
-                        <span className="text-xs font-bold text-slate-500">Фильтры И/ИЛИ</span>
-                        <button type="button" className="text-xs font-bold text-indigo-600" onClick={() => updateArg(arg.id, { filters: [...(arg.filters || []), { logic: 'AND', field: '', op: 'равно', value: '' }] })}>+ Условие</button>
-                      </div>
-                      {(arg.filters || []).map((f, fi) => (
-                        <div key={fi} className="flex flex-wrap gap-2 items-center">
-                          {fi > 0 && (
-                            <select value={f.logic} onChange={(e) => {
-                              const filters = arg.filters.slice();
-                              filters[fi] = { ...f, logic: e.target.value };
-                              updateArg(arg.id, { filters });
-                            }} className="border-slate-300 rounded p-1.5 text-xs w-16">
-                              <option value="AND">И</option>
-                              <option value="OR">ИЛИ</option>
-                            </select>
-                          )}
-                          <select value={f.field} onChange={(e) => {
-                            const filters = arg.filters.slice();
-                            filters[fi] = { ...f, field: e.target.value };
-                            updateArg(arg.id, { filters });
-                          }} className="border-slate-300 rounded p-1.5 text-xs flex-1">
-                            <option value="">Поле...</option>
-                            {(src?.columns || []).map((c) => <option key={c} value={c}>{c}</option>)}
-                          </select>
-                          <select value={f.op} onChange={(e) => {
-                            const filters = arg.filters.slice();
-                            filters[fi] = { ...f, op: e.target.value };
-                            updateArg(arg.id, { filters });
-                          }} className="border-slate-300 rounded p-1.5 text-xs w-28">
-                            {['равно', 'не равно', 'содержит', 'не содержит', 'больше', 'меньше', 'пусто', 'не пусто'].map((o) => <option key={o} value={o}>{o}</option>)}
-                          </select>
-                          <input value={f.value} onChange={(e) => {
-                            const filters = arg.filters.slice();
-                            filters[fi] = { ...f, value: e.target.value };
-                            updateArg(arg.id, { filters });
-                          }} className="border-slate-300 rounded p-1.5 text-xs flex-1" placeholder="Значение" />
-                        </div>
-                      ))}
-                    </div>
-                    <div className="bg-indigo-50 border border-indigo-100 rounded-lg p-2 space-y-2">
-                      <span className="text-xs font-bold text-indigo-800">ВПР-связь с другой таблицей</span>
-                      <SourcePicker
-                        sources={sources}
-                        value={arg.vlookup?.sourceId || null}
-                        onChange={(id) => updateArg(arg.id, { vlookup: { ...(arg.vlookup || {}), sourceId: id } })}
-                        label="Справочник"
-                        excludeIds={arg.sourceId ? [arg.sourceId] : []}
-                      />
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-                        {['leftField', 'rightField', 'pullField'].map((field, i) => {
-                          const labels = ['Поле связи (осн.)', 'Поле соответствия', 'Забираемое поле'];
-                          const cols = field === 'leftField' ? src?.columns : sources.find((s) => s.id === arg.vlookup?.sourceId)?.columns;
-                          return (
-                            <div key={field}>
-                              <label className="text-xs font-bold text-slate-500 mb-1 block">{labels[i]}</label>
-                              <select
-                                value={arg.vlookup?.[field] || ''}
-                                onChange={(e) => updateArg(arg.id, { vlookup: { ...(arg.vlookup || {}), [field]: e.target.value } })}
-                                className="w-full border-slate-300 rounded p-1.5 text-xs bg-white"
-                              >
-                                <option value="">—</option>
-                                {(cols || []).map((c) => <option key={c} value={c}>{c}</option>)}
-                              </select>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-              <button
-                type="button"
-                onClick={() =>
-                  setEditingFormula({
+            <div className="space-y-3 border border-slate-200 rounded-xl p-4">
+              <input value={editingFormula.name} onChange={(e) => setEditingFormula({ ...editingFormula, name: e.target.value })} className="w-full border rounded-lg p-2 font-bold" placeholder="Имя формулы" />
+              {(editingFormula.config.arguments || []).map((arg) => (
+                <div key={arg.id} className="grid grid-cols-1 md:grid-cols-3 gap-2 bg-slate-50 p-3 rounded-lg">
+                  <input value={arg.name} onChange={(e) => setEditingFormula({
                     ...editingFormula,
                     config: {
                       ...editingFormula.config,
-                      arguments: [...editingFormula.config.arguments, makeArgument({ name: `Аргумент ${editingFormula.config.arguments.length + 1}` })],
+                      arguments: editingFormula.config.arguments.map((a) => (a.id === arg.id ? { ...a, name: e.target.value } : a)),
                     },
-                  })
-                }
-                className="text-sm font-bold text-indigo-600"
-              >
-                + Аргумент
-              </button>
-
-              <div className="bg-white border border-slate-200 rounded-xl p-3 space-y-2">
-                <h4 className="font-bold text-slate-800 text-sm">Калькулятор выражения</h4>
-                <div className="flex flex-wrap gap-2">
-                  {(editingFormula.config.arguments || []).map((a) => (
-                    <button key={a.id} type="button" onClick={() => setEditingFormula({
-                      ...editingFormula,
-                      config: {
-                        ...editingFormula.config,
-                        expression: {
-                          type: 'compound',
-                          items: [...(editingFormula.config.expression?.items || []), { type: 'argument', ref: a.id }],
-                        },
-                      },
-                    })} className="text-xs font-bold px-2 py-1 rounded bg-indigo-50 text-indigo-700">{a.name}</button>
-                  ))}
-                  {['+', '-', '*', '/', '(', ')'].map((op) => (
-                    <button key={op} type="button" onClick={() => setEditingFormula({
-                      ...editingFormula,
-                      config: {
-                        ...editingFormula.config,
-                        expression: {
-                          type: 'compound',
-                          items: [...(editingFormula.config.expression?.items || []), { type: 'operator', value: op }],
-                        },
-                      },
-                    })} className="text-xs font-bold px-2 py-1 rounded bg-slate-100 w-8">{op}</button>
-                  ))}
-                  <button type="button" onClick={() => {
-                    const v = window.prompt('Константа', '1');
-                    if (v == null) return;
-                    setEditingFormula({
-                      ...editingFormula,
-                      config: {
-                        ...editingFormula.config,
-                        expression: {
-                          type: 'compound',
-                          items: [...(editingFormula.config.expression?.items || []), { type: 'constant', value: Number(v) }],
-                        },
-                      },
-                    });
-                  }} className="text-xs font-bold px-2 py-1 rounded bg-amber-50 text-amber-800">Константа</button>
-                  <button type="button" onClick={() => setEditingFormula({
+                  })} className="border rounded p-2 text-sm" placeholder="Имя аргумента" />
+                  <SourcePicker sources={sources} value={arg.sourceId} onChange={(id) => setEditingFormula({
                     ...editingFormula,
-                    config: { ...editingFormula.config, expression: { type: 'compound', items: [] } },
-                  })} className="text-xs font-bold px-2 py-1 rounded bg-red-50 text-red-700">Очистить</button>
+                    config: {
+                      ...editingFormula.config,
+                      arguments: editingFormula.config.arguments.map((a) => (a.id === arg.id ? { ...a, sourceId: id } : a)),
+                    },
+                  })} label="Источник" />
+                  <select value={arg.resourceCol} onChange={(e) => setEditingFormula({
+                    ...editingFormula,
+                    config: {
+                      ...editingFormula.config,
+                      arguments: editingFormula.config.arguments.map((a) => (a.id === arg.id ? { ...a, resourceCol: e.target.value } : a)),
+                    },
+                  })} className="border rounded p-2 text-sm bg-white">
+                    <option value="">Колонка-ресурс</option>
+                    {(sources.find((s) => s.id === arg.sourceId)?.columns || []).map((c) => <option key={c} value={c}>{c}</option>)}
+                  </select>
                 </div>
-                <div className="font-mono text-xs bg-slate-900 text-green-400 p-3 rounded-lg overflow-x-auto">
-                  {(editingFormula.config.expression?.items || []).map((it, i) => {
-                    if (it.type === 'argument') {
-                      const a = editingFormula.config.arguments.find((x) => x.id === it.ref);
-                      return <span key={i}>[{a?.name || it.ref}] </span>;
-                    }
-                    if (it.type === 'constant') return <span key={i}>{it.value} </span>;
-                    if (it.type === 'formula') {
-                      const f = formulas.find((x) => x.id === it.ref);
-                      return <span key={i}>{`{${f?.name || it.ref}}`} </span>;
-                    }
-                    return <span key={i}>{it.value} </span>;
-                  }) || '—'}
-                </div>
-              </div>
-
-              {formulaTest && (
-                <div className="bg-green-50 border border-green-200 rounded-lg p-3 text-sm font-bold text-green-800">
-                  Результат теста: {formulaTest.value}
-                </div>
-              )}
-
-              <div className="flex flex-wrap gap-2">
-                <button type="button" onClick={testFormula} className="bg-slate-800 text-white px-4 py-2 rounded-lg font-bold text-sm">Рассчитать (тест)</button>
+              ))}
+              {formulaTest && <div className="text-sm font-bold text-green-800">Результат теста: {formulaTest.value}</div>}
+              <div className="flex gap-2">
+                <button type="button" onClick={testFormula} className="bg-slate-800 text-white px-4 py-2 rounded-lg font-bold text-sm">Тест</button>
                 <button type="button" onClick={saveFormula} className="bg-indigo-600 text-white px-4 py-2 rounded-lg font-bold text-sm inline-flex items-center gap-1"><Save className="w-4 h-4" /> Сохранить</button>
-                <button type="button" onClick={() => setEditingFormula(null)} className="bg-white border border-slate-200 px-4 py-2 rounded-lg font-bold text-sm">Отмена</button>
+                <button type="button" onClick={() => setEditingFormula(null)} className="border px-4 py-2 rounded-lg font-bold text-sm">Отмена</button>
               </div>
             </div>
           )}
         </div>
       )}
 
-      {/* ===== Templates ===== */}
+      {/* ===== Templates: rows × columns × cell rules ===== */}
       {tab === 'templates' && (
         <div className="space-y-4">
           {!editingTpl ? (
             <>
               <button type="button" onClick={startNewTemplate} className="bg-indigo-600 text-white px-4 py-2 rounded-lg font-bold text-sm inline-flex items-center gap-2">
-                <Plus className="w-4 h-4" /> Новый шаблон отчёта
+                <Plus className="w-4 h-4" /> Новый шаблон
               </button>
-              <div className="border border-slate-200 rounded-xl divide-y">
-                {templates.filter((t) => !t.isDeleted).length === 0 && (
-                  <p className="p-4 text-sm text-slate-500 font-medium">Справочник пуст</p>
-                )}
+              <ul className="divide-y divide-slate-100 border border-slate-200 rounded-xl">
                 {templates.filter((t) => !t.isDeleted).map((t) => (
-                  <div key={t.id} className="p-3 flex items-center justify-between gap-3">
+                  <li key={t.id} className="p-3 flex justify-between gap-2 items-center">
                     <div>
                       <div className="font-bold text-sm">{t.name}</div>
-                      <div className="text-xs text-slate-500">{t.group} · строк: {t.structure?.rows?.length || 0} · столбцов: {t.structure?.columns?.length || 0}</div>
+                      <div className="text-xs text-slate-500">
+                        {t.structure?.rows?.length || 0} строк · {t.structure?.columns?.length || 0} столбцов
+                      </div>
                     </div>
-                    <div className="flex gap-2">
-                      <button type="button" onClick={() => setEditingTpl(JSON.parse(JSON.stringify(t)))} className="text-xs font-bold px-3 py-1.5 rounded-lg bg-slate-100">Изменить</button>
-                      <button type="button" onClick={() => persistTemplates(templates.map((x) => x.id === t.id ? { ...x, isDeleted: true } : x))} className="text-slate-400 hover:text-red-500"><Trash2 className="w-4 h-4" /></button>
-                    </div>
-                  </div>
+                    <button type="button" onClick={() => setEditingTpl(t)} className="text-xs font-bold px-3 py-1.5 bg-slate-100 rounded-lg">Изменить</button>
+                  </li>
                 ))}
-              </div>
+              </ul>
             </>
           ) : (
-            <div className="space-y-4 bg-slate-50 border border-slate-200 rounded-xl p-4">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                <input value={editingTpl.name} onChange={(e) => setEditingTpl({ ...editingTpl, name: e.target.value })} className="border-slate-300 rounded p-2 text-sm font-bold" placeholder="Название отчёта" />
-                <input value={editingTpl.group} onChange={(e) => setEditingTpl({ ...editingTpl, group: e.target.value })} className="border-slate-300 rounded p-2 text-sm" placeholder="Группа" />
-              </div>
-              <label className="bg-emerald-50 border border-emerald-200 text-emerald-800 px-3 py-2 rounded-lg cursor-pointer font-bold text-xs inline-flex items-center gap-2 w-fit">
-                Импорт структуры из Excel
+            <div className="space-y-5">
+              <input
+                value={editingTpl.name}
+                onChange={(e) => setEditingTpl({ ...editingTpl, name: e.target.value })}
+                className="w-full border rounded-lg p-2.5 font-bold text-lg"
+                placeholder="Название шаблона"
+              />
+              <label className="inline-flex items-center gap-2 text-sm font-bold text-indigo-700 cursor-pointer">
+                <Plus className="w-4 h-4" /> Импорт строк из Excel
                 <input type="file" accept=".xlsx,.xls,.csv" className="hidden" onChange={(e) => { importTplStructure(e.target.files?.[0]); e.target.value = ''; }} />
               </label>
 
-              <div className="overflow-auto border border-slate-200 rounded-xl bg-white">
+              {/* Rows */}
+              <div className="border border-slate-200 rounded-xl overflow-hidden">
+                <div className="bg-slate-50 px-4 py-2 font-bold text-sm text-slate-800 flex justify-between">
+                  <span>Строки (показатели + счета)</span>
+                  <button
+                    type="button"
+                    className="text-indigo-600 text-xs font-bold"
+                    onClick={() => patchTpl((s) => {
+                      const id = createRowId();
+                      const colIds = (s.columns || []).map((c) => c.id);
+                      const rules = { ...s.rules, [id]: {} };
+                      colIds.forEach((cid) => { rules[id][cid] = defaultCellRule(); });
+                      return {
+                        ...s,
+                        rows: [...(s.rows || []), { id, name: 'Новый показатель', accounts: ['51'], expandBy: '', level: 0 }],
+                        rules,
+                      };
+                    })}
+                  >
+                    + Строка
+                  </button>
+                </div>
+                <div className="divide-y divide-slate-100">
+                  {(editingTpl.structure.rows || []).map((row) => (
+                    <div key={row.id} className="p-3 grid grid-cols-1 md:grid-cols-4 gap-2 items-start">
+                      <input
+                        value={row.name}
+                        onChange={(e) => patchTpl((s) => ({
+                          ...s,
+                          rows: s.rows.map((r) => (r.id === row.id ? { ...r, name: e.target.value } : r)),
+                        }))}
+                        className="border rounded p-2 text-sm font-bold"
+                        placeholder="Название"
+                      />
+                      <input
+                        value={(row.accounts || []).join(', ')}
+                        onChange={(e) => patchTpl((s) => ({
+                          ...s,
+                          rows: s.rows.map((r) =>
+                            r.id === row.id
+                              ? {
+                                  ...r,
+                                  accounts: e.target.value.split(/[,;\s]+/).map((x) => x.trim()).filter(Boolean),
+                                }
+                              : r
+                          ),
+                        }))}
+                        className="border rounded p-2 text-sm font-mono"
+                        placeholder="Счета: 50, 51"
+                      />
+                      <input
+                        value={row.expandBy || ''}
+                        onChange={(e) => patchTpl((s) => ({
+                          ...s,
+                          rows: s.rows.map((r) => (r.id === row.id ? { ...r, expandBy: e.target.value } : r)),
+                        }))}
+                        className="border rounded p-2 text-sm"
+                        placeholder="Развернуть по полю (опц.)"
+                        list="analytic-fields"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => patchTpl((s) => {
+                          const rules = { ...s.rules };
+                          delete rules[row.id];
+                          return { ...s, rows: s.rows.filter((r) => r.id !== row.id), rules };
+                        })}
+                        className="text-red-500 justify-self-end p-2"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Columns */}
+              <div className="border border-slate-200 rounded-xl overflow-hidden">
+                <div className="bg-slate-50 px-4 py-2 font-bold text-sm text-slate-800 flex justify-between">
+                  <span>Столбцы (период + фильтры)</span>
+                  <button
+                    type="button"
+                    className="text-indigo-600 text-xs font-bold"
+                    onClick={() => patchTpl((s) => {
+                      const id = createColId();
+                      const rules = { ...s.rules };
+                      (s.rows || []).forEach((r) => {
+                        rules[r.id] = { ...(rules[r.id] || {}), [id]: defaultCellRule() };
+                      });
+                      return {
+                        ...s,
+                        columns: [...(s.columns || []), { id, name: 'Новый период', startDate: '', endDate: '', filters: [] }],
+                        rules,
+                      };
+                    })}
+                  >
+                    + Столбец
+                  </button>
+                </div>
+                <div className="divide-y divide-slate-100">
+                  {(editingTpl.structure.columns || []).map((col) => (
+                    <div key={col.id} className="p-3 space-y-2">
+                      <div className="grid grid-cols-1 md:grid-cols-4 gap-2">
+                        <input
+                          value={col.name}
+                          onChange={(e) => patchTpl((s) => ({
+                            ...s,
+                            columns: s.columns.map((c) => (c.id === col.id ? { ...c, name: e.target.value } : c)),
+                          }))}
+                          className="border rounded p-2 text-sm font-bold"
+                          placeholder="Имя столбца"
+                        />
+                        <input
+                          type="date"
+                          value={col.startDate || ''}
+                          onChange={(e) => patchTpl((s) => ({
+                            ...s,
+                            columns: s.columns.map((c) => (c.id === col.id ? { ...c, startDate: e.target.value } : c)),
+                          }))}
+                          className="border rounded p-2 text-sm"
+                        />
+                        <input
+                          type="date"
+                          value={col.endDate || ''}
+                          onChange={(e) => patchTpl((s) => ({
+                            ...s,
+                            columns: s.columns.map((c) => (c.id === col.id ? { ...c, endDate: e.target.value } : c)),
+                          }))}
+                          className="border rounded p-2 text-sm"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => patchTpl((s) => {
+                            const rules = { ...s.rules };
+                            Object.keys(rules).forEach((rid) => {
+                              if (rules[rid]) {
+                                const copy = { ...rules[rid] };
+                                delete copy[col.id];
+                                rules[rid] = copy;
+                              }
+                            });
+                            return { ...s, columns: s.columns.filter((c) => c.id !== col.id), rules };
+                          })}
+                          className="text-red-500 justify-self-end p-2"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                      <div className="text-xs text-slate-500 font-medium">
+                        Фильтры столбца (поле=значения через запятую), напр. Организация=ООО Альфа
+                      </div>
+                      <input
+                        value={(col.filters || [])
+                          .map((f) => `${f.columnName}=${(f.selectedValues || []).join('|')}`)
+                          .join('; ')}
+                        onChange={(e) => {
+                          const filters = e.target.value
+                            .split(';')
+                            .map((part) => part.trim())
+                            .filter(Boolean)
+                            .map((part) => {
+                              const [columnName, vals] = part.split('=');
+                              return {
+                                columnName: (columnName || '').trim(),
+                                selectedValues: (vals || '')
+                                  .split('|')
+                                  .map((v) => v.trim())
+                                  .filter(Boolean),
+                              };
+                            })
+                            .filter((f) => f.columnName);
+                          patchTpl((s) => ({
+                            ...s,
+                            columns: s.columns.map((c) => (c.id === col.id ? { ...c, filters } : c)),
+                          }));
+                        }}
+                        className="w-full border rounded p-2 text-sm font-mono"
+                        placeholder="Организация=ООО Альфа|ООО Бета"
+                      />
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Cell rules matrix */}
+              <div className="border border-slate-200 rounded-xl overflow-auto">
+                <div className="bg-slate-50 px-4 py-2 font-bold text-sm text-slate-800 sticky left-0">
+                  Правила ячеек (type / indicator / metric / expand)
+                </div>
                 <table className="min-w-full text-xs">
-                  <thead className="bg-slate-50">
-                    <tr>
-                      <th className="p-2 text-left">№</th>
-                      <th className="p-2 text-left">Код</th>
-                      <th className="p-2 text-left">Наименование</th>
-                      <th className="p-2 text-left">Тип</th>
-                      {editingTpl.structure.columns.map((c) => (
-                        <th key={c.code} className="p-2 text-left">{c.name}</th>
+                  <thead>
+                    <tr className="bg-white border-b">
+                      <th className="p-2 text-left">Строка \\ Столбец</th>
+                      {(editingTpl.structure.columns || []).map((c) => (
+                        <th key={c.id} className="p-2 text-left font-bold">{c.name}</th>
                       ))}
-                      <th className="p-2" />
                     </tr>
                   </thead>
                   <tbody>
-                    {editingTpl.structure.rows.map((row) => (
-                      <tr key={row.number} className="border-t border-slate-100">
-                        <td className="p-2 font-mono">{row.number}</td>
-                        <td className="p-2">
-                          <input value={row.code} onChange={(e) => {
-                            const rows = editingTpl.structure.rows.map((r) => r.number === row.number ? { ...r, code: e.target.value } : r);
-                            setEditingTpl({ ...editingTpl, structure: { ...editingTpl.structure, rows } });
-                          }} className="border rounded px-1 py-0.5 w-20" />
-                        </td>
-                        <td className="p-2">
-                          <input value={row.name} onChange={(e) => {
-                            const rows = editingTpl.structure.rows.map((r) => r.number === row.number ? { ...r, name: e.target.value } : r);
-                            setEditingTpl({ ...editingTpl, structure: { ...editingTpl.structure, rows } });
-                          }} className="border rounded px-1 py-0.5 w-40" style={{ paddingLeft: 8 + (row.level || 0) * 12 }} />
-                        </td>
-                        <td className="p-2">
-                          <select value={row.type} onChange={(e) => {
-                            const rows = editingTpl.structure.rows.map((r) => r.number === row.number ? { ...r, type: e.target.value } : r);
-                            setEditingTpl({ ...editingTpl, structure: { ...editingTpl.structure, rows } });
-                          }} className="border rounded px-1 py-0.5">
-                            <option value="calculation">Обычная</option>
-                            <option value="consolidating">Консолидирующая</option>
-                            <option value="total">Итоговая</option>
-                            <option value="hidden">Скрытая</option>
-                          </select>
-                        </td>
-                        {editingTpl.structure.columns.map((col) => {
-                          const key = `row:${row.number},col:${col.code}`;
-                          const rule = editingTpl.structure.cellRules?.[key] || { type: 'empty' };
+                    {(editingTpl.structure.rows || []).map((row) => (
+                      <tr key={row.id} className="border-t border-slate-100 align-top">
+                        <td className="p-2 font-bold whitespace-nowrap">{row.name}</td>
+                        {(editingTpl.structure.columns || []).map((col) => {
+                          const rule = editingRuleFor(row.id, col.id);
                           return (
-                            <td key={col.code} className="p-2 align-top">
-                              <select
-                                value={rule.type}
-                                onChange={(e) => {
-                                  const type = e.target.value;
-                                  if (type === 'empty') setCellRule(row.number, col.code, null);
-                                  else if (type === 'formula') setCellRule(row.number, col.code, { type, formulaId: formulas[0]?.id || '' });
-                                  else if (type === 'rowTotal') setCellRule(row.number, col.code, { type, expression: '' });
-                                  else if (type === 'colTotal') setCellRule(row.number, col.code, { type, aggregation: 'SUM' });
-                                  else if (type === 'constant') setCellRule(row.number, col.code, { type, value: 0 });
-                                }}
-                                className="border rounded px-1 py-0.5 w-full mb-1"
-                              >
-                                <option value="empty">Пусто</option>
-                                <option value="formula">Формула</option>
-                                <option value="rowTotal">Итоги по строкам</option>
-                                <option value="colTotal">Итоги по столбцам</option>
-                                <option value="constant">Константа</option>
-                              </select>
-                              {rule.type === 'formula' && (
-                                <select value={rule.formulaId || ''} onChange={(e) => setCellRule(row.number, col.code, { ...rule, formulaId: e.target.value })} className="border rounded px-1 py-0.5 w-full">
-                                  <option value="">—</option>
-                                  {formulas.filter((f) => !f.isDeleted).map((f) => <option key={f.id} value={f.id}>{f.name}</option>)}
+                            <td key={col.id} className="p-2 min-w-[200px]">
+                              <div className="space-y-1">
+                                <select
+                                  value={rule.type || 'db'}
+                                  onChange={(e) => patchTpl((s) => setCellRule(s, row.id, col.id, { ...rule, type: e.target.value }))}
+                                  className="w-full border rounded p-1 bg-white"
+                                >
+                                  <option value="db">db (проводки)</option>
+                                  <option value="formula">formula</option>
+                                  <option value="constant">constant</option>
                                 </select>
-                              )}
-                              {rule.type === 'rowTotal' && (
-                                <input
-                                  value={rule.expression || ''}
-                                  onChange={(e) => setCellRule(row.number, col.code, { ...rule, expression: e.target.value })}
-                                  onBlur={(e) => {
-                                    if (e.target.value.trim().startsWith('=')) {
-                                      setCellRule(row.number, col.code, { ...rule, expression: excelFormulaToRowTotal(e.target.value) });
-                                    }
-                                  }}
-                                  placeholder="[1]+[2] или =B1+B2"
-                                  className="border rounded px-1 py-0.5 w-full font-mono"
-                                />
-                              )}
-                              {rule.type === 'constant' && (
-                                <input type="number" value={rule.value ?? 0} onChange={(e) => setCellRule(row.number, col.code, { ...rule, value: Number(e.target.value) })} className="border rounded px-1 py-0.5 w-full" />
-                              )}
+                                {rule.type === 'db' && (
+                                  <>
+                                    <select
+                                      value={rule.indicatorType || 'turnover'}
+                                      onChange={(e) => patchTpl((s) => setCellRule(s, row.id, col.id, { ...rule, indicatorType: e.target.value }))}
+                                      className="w-full border rounded p-1 bg-white"
+                                    >
+                                      {INDICATOR_OPTS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                                    </select>
+                                    <select
+                                      value={rule.metricType || 'debit'}
+                                      onChange={(e) => patchTpl((s) => setCellRule(s, row.id, col.id, { ...rule, metricType: e.target.value }))}
+                                      className="w-full border rounded p-1 bg-white"
+                                    >
+                                      {METRIC_OPTS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+                                    </select>
+                                    <select
+                                      value={rule.expandAnalytic || 'no'}
+                                      onChange={(e) => patchTpl((s) => setCellRule(s, row.id, col.id, { ...rule, expandAnalytic: e.target.value }))}
+                                      className="w-full border rounded p-1 bg-white"
+                                    >
+                                      <option value="no">expand: no</option>
+                                      <option value="debit">expand: debit</option>
+                                      <option value="credit">expand: credit</option>
+                                    </select>
+                                  </>
+                                )}
+                                {rule.type === 'formula' && (
+                                  <select
+                                    value={rule.formulaId || ''}
+                                    onChange={(e) => patchTpl((s) => setCellRule(s, row.id, col.id, { ...rule, formulaId: e.target.value }))}
+                                    className="w-full border rounded p-1 bg-white"
+                                  >
+                                    <option value="">Формула…</option>
+                                    {formulas.filter((f) => !f.isDeleted).map((f) => (
+                                      <option key={f.id} value={f.id}>{f.name}</option>
+                                    ))}
+                                  </select>
+                                )}
+                                {rule.type === 'constant' && (
+                                  <input
+                                    type="number"
+                                    value={rule.value ?? ''}
+                                    onChange={(e) => patchTpl((s) => setCellRule(s, row.id, col.id, { ...rule, value: e.target.value }))}
+                                    className="w-full border rounded p-1"
+                                  />
+                                )}
+                              </div>
                             </td>
                           );
                         })}
-                        <td className="p-2">
-                          <button type="button" onClick={() => {
-                            const rows = editingTpl.structure.rows.filter((r) => r.number !== row.number);
-                            setEditingTpl({ ...editingTpl, structure: { ...editingTpl.structure, rows } });
-                          }} className="text-red-500"><Trash2 className="w-3.5 h-3.5" /></button>
-                        </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
-              <div className="flex flex-wrap gap-2">
-                <button type="button" onClick={() => {
-                  const rows = editingTpl.structure.rows;
-                  const number = (rows[rows.length - 1]?.number || 0) + 1;
-                  setEditingTpl({
-                    ...editingTpl,
-                    structure: {
-                      ...editingTpl.structure,
-                      rows: [...rows, { number, code: String(number).padStart(2, '0'), name: `Строка ${number}`, level: 0, type: 'calculation', zone: '', sign: '+', hidden: false }],
-                    },
-                  });
-                }} className="text-sm font-bold text-indigo-600">+ Строка</button>
-                <button type="button" onClick={() => {
-                  const code = `C${editingTpl.structure.columns.length + 1}`;
-                  setEditingTpl({
-                    ...editingTpl,
-                    structure: {
-                      ...editingTpl.structure,
-                      columns: [...editingTpl.structure.columns, { code, name: `Столбец ${code}`, type: 'static', format: 'number' }],
-                    },
-                  });
-                }} className="text-sm font-bold text-indigo-600">+ Столбец</button>
-                <button type="button" onClick={saveTemplate} className="bg-indigo-600 text-white px-4 py-2 rounded-lg font-bold text-sm ml-auto">Сохранить шаблон</button>
-                <button type="button" onClick={() => setEditingTpl(null)} className="bg-white border px-4 py-2 rounded-lg font-bold text-sm">Отмена</button>
+
+              <div className="flex gap-2">
+                <button type="button" onClick={saveTemplate} className="bg-indigo-600 text-white px-5 py-2.5 rounded-xl font-bold text-sm inline-flex items-center gap-2">
+                  <Save className="w-4 h-4" /> Сохранить шаблон
+                </button>
+                <button type="button" onClick={() => setEditingTpl(null)} className="border px-5 py-2.5 rounded-xl font-bold text-sm">Отмена</button>
               </div>
             </div>
           )}
         </div>
       )}
 
-      {/* ===== Universal ===== */}
+      {/* ===== Pivot / Universal with drill-down ===== */}
       {tab === 'universal' && (
         <div className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <SourcePicker
+            sources={sources}
+            value={uniSourceId}
+            onChange={setUniSourceId}
+            label="Журнал проводок (из реестра)"
+          />
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             <div>
               <label className="text-xs font-bold text-slate-500 mb-1 block">Шаблон отчёта</label>
               <select value={uniTplId || ''} onChange={(e) => setUniTplId(e.target.value || null)} className="w-full border-slate-300 rounded-lg p-2 text-sm font-bold bg-white">
-                <option value="">Выберите...</option>
+                <option value="">Выберите…</option>
                 {templates.filter((t) => !t.isDeleted).map((t) => (
                   <option key={t.id} value={t.id}>{t.name}</option>
                 ))}
               </select>
             </div>
             <div>
-              <label className="text-xs font-bold text-slate-500 mb-1 block">Период (подпись)</label>
-              <input value={uniPeriod} onChange={(e) => setUniPeriod(e.target.value)} placeholder="Май 2024" className="w-full border-slate-300 rounded-lg p-2 text-sm font-bold" />
+              <label className="text-xs font-bold text-slate-500 mb-1 block">Глобальный период с</label>
+              <input type="date" value={uniGlobalFrom} onChange={(e) => setUniGlobalFrom(e.target.value)} className="w-full border-slate-300 rounded-lg p-2 text-sm" />
+            </div>
+            <div>
+              <label className="text-xs font-bold text-slate-500 mb-1 block">Глобальный период по</label>
+              <input type="date" value={uniGlobalTo} onChange={(e) => setUniGlobalTo(e.target.value)} className="w-full border-slate-300 rounded-lg p-2 text-sm" />
             </div>
           </div>
-          <button type="button" onClick={runUniversal} className="bg-indigo-600 text-white px-6 py-3 rounded-xl font-bold hover:bg-indigo-700 inline-flex items-center gap-2">
-            <Play className="w-4 h-4" /> Сформировать универсальный отчёт
+          <p className="text-xs text-slate-500 font-medium">
+            Даты столбца перекрывают глобальные. Клик по числу открывает проводки; сумма в подвале = ячейка.
+          </p>
+          <button type="button" onClick={runPivot} className="bg-indigo-600 text-white px-6 py-3 rounded-xl font-bold hover:bg-indigo-700 inline-flex items-center gap-2">
+            <Play className="w-4 h-4" /> Сформировать сводный отчёт
           </button>
+
           {uniResult && (
             <div className="space-y-3">
               {uniResult.errors?.length > 0 && (
                 <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs text-amber-900">
                   {uniResult.errors.map((e, i) => (
-                    <div key={i}>Строка {e.row}, столбец {e.col}: {e.message}</div>
+                    <div key={i}>{e.row} / {e.col}: {e.message}</div>
                   ))}
                 </div>
               )}
-              <div className="overflow-auto border border-slate-200 rounded-xl max-h-96">
+              <div className="overflow-auto border border-slate-200 rounded-xl max-h-[32rem]">
                 <table className="min-w-full text-xs">
                   <thead className="bg-slate-50 sticky top-0">
                     <tr>
-                      {uniResult.columnHeaders.map((h) => (
-                        <th key={h.key} className="px-3 py-2 text-left font-bold text-slate-600">{h.label}</th>
+                      <th className="px-3 py-2 text-left font-bold text-slate-600">Показатель</th>
+                      {uniResult.columns.map((c) => (
+                        <th key={c.id} className="px-3 py-2 text-right font-bold text-slate-600 whitespace-nowrap">
+                          {c.name}
+                          {(c.startDate || c.endDate) && (
+                            <div className="font-medium text-[10px] text-slate-400">
+                              {c.startDate || '…'} — {c.endDate || '…'}
+                            </div>
+                          )}
+                        </th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
-                    {uniResult.rows.map((row, ri) => (
-                      <tr key={ri} className="odd:bg-white even:bg-slate-50 border-t border-slate-100">
-                        {uniResult.columnHeaders.map((h) => {
-                          const val = row[h.key];
-                          const isNum = typeof val === 'number';
-                          const drillKey = h.key.includes('::')
-                            ? `${templates.find((t) => t.id === uniTplId)?.structure?.rows?.find((r) => r.code === row.code)?.number}:${h.key.split('::')[0]}`
-                            : null;
+                    {uniResult.rows.map((row) => (
+                      <tr key={row.id} className="odd:bg-white even:bg-slate-50 border-t border-slate-100">
+                        <td
+                          className="px-3 py-1.5 font-bold text-slate-800"
+                          style={{ paddingLeft: 12 + (row.level || 0) * 14 }}
+                        >
+                          {row.name}
+                          {!row.isChild && row.accounts?.length > 0 && (
+                            <span className="ml-2 text-[10px] font-mono text-slate-400">
+                              [{row.accounts.join(', ')}]
+                            </span>
+                          )}
+                        </td>
+                        {uniResult.columns.map((col) => {
+                          const ctx = uniResult.cells[`${row.id}|${col.id}`];
+                          const val = row.values[col.id];
+                          const clickable = ctx?.drillable;
+                          const isFormula = ctx?.rule?.type === 'formula';
                           return (
                             <td
-                              key={h.key}
-                              className={`px-3 py-1.5 ${isNum ? 'text-right font-mono cursor-pointer hover:bg-indigo-50' : ''}`}
-                              style={{ paddingLeft: h.key === 'name' ? 8 + (row.level || 0) * 12 : undefined }}
-                              onClick={() => {
-                                if (!isNum || !drillKey) return;
-                                setUniDrill(uniResult.drilldown?.[drillKey] || null);
-                              }}
+                              key={col.id}
+                              className={`px-3 py-1.5 text-right font-mono ${
+                                clickable
+                                  ? 'cursor-pointer text-indigo-700 font-bold hover:bg-indigo-50 underline decoration-dotted'
+                                  : isFormula
+                                    ? 'cursor-not-allowed text-slate-500'
+                                    : ''
+                              }`}
+                              title={
+                                clickable
+                                  ? 'Показать проводки'
+                                  : isFormula
+                                    ? 'Формула — drill-down недоступен'
+                                    : undefined
+                              }
+                              onClick={() => openDrill(row, col)}
                             >
-                              {val == null || val === '' ? '—' : String(val)}
+                              {fmt(val)}
                             </td>
                           );
                         })}
@@ -875,38 +886,34 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
                   </tbody>
                 </table>
               </div>
-              {uniDrill && (
-                <div className="bg-indigo-50 border border-indigo-200 rounded-xl p-3 text-sm">
-                  <h4 className="font-bold text-indigo-900 mb-2">Расшифровка (drill-down)</h4>
-                  <pre className="text-xs overflow-auto max-h-40 bg-white p-2 rounded border">{JSON.stringify(uniDrill, null, 2)}</pre>
-                </div>
-              )}
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2">
                 <button
                   type="button"
                   onClick={() => {
                     const flat = uniResult.rows.map((r) => {
-                      const o = {};
-                      uniResult.columnHeaders.forEach((h) => { o[h.label] = r[h.key]; });
+                      const o = { Показатель: r.name };
+                      uniResult.columns.forEach((c) => { o[c.name] = r.values[c.id]; });
                       return o;
                     });
-                    exportToExcel(flat, 'Universal_Report.xlsx');
+                    exportToExcel(flat, 'Pivot_Report.xlsx');
                   }}
                   className="bg-green-600 text-white px-4 py-2 rounded-lg font-bold text-sm"
                 >
                   Excel
                 </button>
-                <button type="button" onClick={() => window.print()} className="bg-slate-700 text-white px-4 py-2 rounded-lg font-bold text-sm">Печать / PDF</button>
+                <button type="button" onClick={() => window.print()} className="bg-slate-700 text-white px-4 py-2 rounded-lg font-bold text-sm">
+                  Печать / PDF
+                </button>
                 {onRegisterResult && (
                   <button
                     type="button"
                     onClick={() => {
                       const flat = uniResult.rows.map((r) => {
-                        const o = {};
-                        uniResult.columnHeaders.forEach((h) => { o[h.label] = r[h.key]; });
+                        const o = { Показатель: r.name };
+                        uniResult.columns.forEach((c) => { o[c.name] = r.values[c.id]; });
                         return o;
                       });
-                      onRegisterResult(flat, 'Универсальный_отчёт');
+                      onRegisterResult(flat, 'Сводный_отчёт');
                     }}
                     className="bg-slate-800 text-white px-4 py-2 rounded-lg font-bold text-sm"
                   >
@@ -916,8 +923,18 @@ export default function ReportsPanel({ sources = [], onRegisterResult }) {
               </div>
             </div>
           )}
+
+          {uniSource && filterFieldOptions.length > 0 && (
+            <datalist id="analytic-fields">
+              {filterFieldOptions.map((c) => (
+                <option key={c} value={c} />
+              ))}
+            </datalist>
+          )}
         </div>
       )}
+
+      <DrillDownModal payload={drill} onClose={() => setDrill(null)} />
     </div>
   );
 }
