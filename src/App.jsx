@@ -8,6 +8,7 @@ import {
   Database,
   ExternalLink,
   Filter,
+  FileBarChart,
   Layers,
   RefreshCcw,
   Save,
@@ -23,6 +24,8 @@ import {
 import DataPreview from './components/DataPreview.jsx';
 import SourcePicker from './components/SourcePicker.jsx';
 import SourceUploader from './components/SourceUploader.jsx';
+import RulesRegistry from './components/RulesRegistry.jsx';
+import ReportsPanel from './components/ReportsPanel.jsx';
 import { columnsFromData, uniqueSorted } from './lib/parse.js';
 import {
   exportToExcel,
@@ -48,6 +51,17 @@ import {
   expandSubconto,
   listSubcontoDictionaries,
 } from './lib/subconto.js';
+import {
+  duplicateRule,
+  loadRulesFromStorage,
+  makeTransformRule,
+  removeRule,
+  reorderRules,
+  saveRulesToStorage,
+  sortRules,
+  toggleRule,
+  upsertRule,
+} from './lib/transformRules.js';
 
 const RULES = [
   { id: 1, name: 'Обогащение/объединение данных', desc: 'Добавление аналитик, объединение баз, тегирование', icon: Search, color: 'text-blue-600', bg: 'bg-blue-100', border: 'hover:border-blue-300' },
@@ -91,6 +105,9 @@ export default function App() {
   const [mapTableId, setMapTableId] = useState(null);
   const [opsSourceId, setOpsSourceId] = useState(null);
   const [coaMatrixId, setCoaMatrixId] = useState(null);
+  const [transformRules, setTransformRules] = useState(() => loadRulesFromStorage());
+  const [editingRuleId, setEditingRuleId] = useState(null);
+  const [ruleNameDraft, setRuleNameDraft] = useState('');
 
   const [enrichMode, setEnrichMode] = useState('rules');
   const [enrichTargetCol, setEnrichTargetCol] = useState('');
@@ -360,6 +377,216 @@ export default function App() {
   }, [gsheetClientId]);
 
   useEffect(() => {
+    saveRulesToStorage(transformRules);
+  }, [transformRules]);
+
+  const captureRuleBindings = () => ({
+    primarySourceId,
+    lookupSourceId,
+    opsSourceId,
+    coaMatrixId,
+    rulesTableId,
+    mapTableId,
+  });
+
+  const captureRuleConfig = () => {
+    if (activeRule === 1) {
+      return {
+        mode: enrichMode,
+        targetCol: enrichTargetCol,
+        pullCols: enrichPullCols.map((p) => p.col).filter(Boolean),
+        unmatchedAction: enrichUnmatched,
+        keys: enrichKeys,
+        rules: enrichRules,
+      };
+    }
+    if (activeRule === 2) {
+      return {
+        keys: allocKeys,
+        sumCol: allocSumCol,
+        driverCol: allocDriverCol,
+        carryCols: allocCarryCols.map((p) => p.col).filter(Boolean),
+        addFormula: allocAddFormula,
+        aggregateSource: allocAggregate,
+      };
+    }
+    if (activeRule === 3) return { sourceCol: mapSourceCol, rules: mapRules };
+    if (activeRule === 4) return { rules: elimRules, action: elimAction };
+    if (activeRule === 5) {
+      return { itemCol: aggItemCol, sumCol: aggSumCol, groupCols: aggGroupCols, groups: aggGroups };
+    }
+    if (activeRule === 6) {
+      return {
+        rules: accrualRules,
+        action: accrualAction,
+        months: accrualMonths,
+        dateCol: accrualDateCol,
+        dateVal: accrualDateVal,
+        sumCol: accrualSumCol,
+      };
+    }
+    if (activeRule === 7) return { opsCol, virtRules };
+    if (activeRule === 8) return { sumCol: revalSumCol, rate: revalRate };
+    return {};
+  };
+
+  const saveCurrentAsRule = () => {
+    if (!activeRule) return;
+    const name =
+      ruleNameDraft.trim() ||
+      `${RULES.find((r) => r.id === activeRule)?.name || 'Правило'} ${new Date().toLocaleString('ru-RU')}`;
+    const base = makeTransformRule({
+      id: editingRuleId || undefined,
+      name,
+      toolId: activeRule,
+      config: captureRuleConfig(),
+      bindings: captureRuleBindings(),
+      order: editingRuleId
+        ? transformRules.find((r) => r.id === editingRuleId)?.order || transformRules.length + 1
+        : transformRules.length + 1,
+    });
+    setTransformRules((prev) => upsertRule(prev, base));
+    setEditingRuleId(base.id);
+    setRuleNameDraft(base.name);
+    setSuccessMsg(`Правило «${base.name}» сохранено в реестре`);
+  };
+
+  const applyRuleToForm = (rule) => {
+    setActiveRule(rule.toolId);
+    setEditingRuleId(rule.id);
+    setRuleNameDraft(rule.name);
+    setShowResult(false);
+    const b = rule.bindings || {};
+    if (b.primarySourceId) setPrimarySourceId(b.primarySourceId);
+    if (b.lookupSourceId) setLookupSourceId(b.lookupSourceId);
+    if (b.opsSourceId) setOpsSourceId(b.opsSourceId);
+    if (b.coaMatrixId) setCoaMatrixId(b.coaMatrixId);
+    if (b.rulesTableId) setRulesTableId(b.rulesTableId);
+    if (b.mapTableId) setMapTableId(b.mapTableId);
+    const c = rule.config || {};
+    if (rule.toolId === 1) {
+      setEnrichMode(c.mode || 'rules');
+      setEnrichTargetCol(c.targetCol || '');
+      setEnrichPullCols(
+        (c.pullCols || []).length
+          ? c.pullCols.map((col, i) => ({ id: i + 1, col }))
+          : [{ id: 1, col: '' }]
+      );
+      setEnrichUnmatched(c.unmatchedAction || 'keep');
+      setEnrichKeys(c.keys?.length ? c.keys : [{ id: 1, k1: '', k2: '', logic: 'AND', exact: true, synonyms: [] }]);
+      setEnrichRules(c.rules || []);
+    } else if (rule.toolId === 2) {
+      setAllocKeys(c.keys?.length ? c.keys : [{ id: 1, k1: '', k2: '' }]);
+      setAllocSumCol(c.sumCol || '');
+      setAllocDriverCol(c.driverCol || '');
+      setAllocCarryCols(
+        (c.carryCols || []).length
+          ? c.carryCols.map((col, i) => ({ id: i + 1, col }))
+          : [{ id: 1, col: '' }]
+      );
+      setAllocAddFormula(c.addFormula !== false);
+      setAllocAggregate(!!c.aggregateSource);
+    } else if (rule.toolId === 3) {
+      setMapSourceCol(c.sourceCol || '');
+      setMapRules(c.rules?.length ? c.rules : [{ id: 1, src: '', target: '' }]);
+    } else if (rule.toolId === 4) {
+      setElimRules(c.rules?.length ? c.rules : [{ id: 1, logic: 'AND', col: '', op: 'равно', val: '' }]);
+      setElimAction(c.action || 'soft');
+    } else if (rule.toolId === 5) {
+      setAggItemCol(c.itemCol || '');
+      setAggSumCol(c.sumCol || '');
+      setAggGroupCols(c.groupCols || []);
+      setAggGroups(c.groups || []);
+    } else if (rule.toolId === 6) {
+      setAccrualRules(c.rules?.length ? c.rules : [{ id: 1, logic: 'AND', col: '', op: 'содержит', val: '' }]);
+      setAccrualAction(c.action || 'split');
+      setAccrualMonths(c.months || '12');
+      setAccrualDateCol(c.dateCol || '');
+      setAccrualDateVal(c.dateVal || '');
+      setAccrualSumCol(c.sumCol || '');
+    } else if (rule.toolId === 7) {
+      setOpsCol(c.opsCol || '');
+      setVirtRules(c.virtRules || []);
+    } else if (rule.toolId === 8) {
+      setRevalSumCol(c.sumCol || '');
+      setRevalRate(c.rate || '1.2');
+    }
+    setSuccessMsg(`Загружено правило «${rule.name}» — можно изменить и прогнать`);
+  };
+
+  const runSavedRule = (rule) => {
+    applyRuleToForm(rule);
+    try {
+      executeMappingFromRule(rule);
+    } catch (err) {
+      setErrorMsg(err.message || String(err));
+    }
+  };
+
+  const executeMappingFromRule = (rule) => {
+    setErrorMsg('');
+    setSuccessMsg('');
+    const b = rule.bindings || {};
+    const primarySrc = getSource(sources, b.primarySourceId || primarySourceId);
+    const lookupSrc = getSource(sources, b.lookupSourceId || lookupSourceId);
+    const opsSrc = getSource(sources, b.opsSourceId || opsSourceId);
+    const config = rule.config || {};
+    let finalData;
+    if (rule.toolId === 1 && config.mode === 'vlookup') {
+      if (!lookupSrc) throw new Error('В правиле не задан справочник');
+      if (!primarySrc) throw new Error('В правиле не задана основная таблица');
+      const snapshot = {
+        sourceData: primarySrc.data,
+        lookupData: lookupSrc.data,
+        keys: config.keys,
+        pullCols: config.pullCols,
+        unmatchedAction: config.unmatchedAction,
+      };
+      const merged = mergeSources({ ...snapshot, resolutions: {} });
+      finalData = merged.data;
+      setEnrichMergeSnapshot(snapshot);
+      setEnrichConflicts(merged.conflicts);
+      setEnrichResolutions({});
+    } else {
+      finalData = runRule(rule.toolId, {
+        source1: primarySrc?.data || [],
+        source2: lookupSrc?.data || [],
+        columns: primarySrc?.columns || [],
+        opsData: opsSrc?.data || [],
+        config,
+      });
+      setEnrichConflicts([]);
+    }
+    persistResult(finalData, `${rule.name}_результат`, {
+      forceRegister: true,
+      toolId: rule.toolId,
+    });
+    setSuccessMsg(`Правило «${rule.name}»: обработано строк ${finalData.length}`);
+  };
+
+  const moveRule = (id, dir) => {
+    const sorted = sortRules(transformRules);
+    const idx = sorted.findIndex((r) => r.id === id);
+    if (idx < 0) return;
+    const swapIdx = dir === 'up' ? idx - 1 : idx + 1;
+    if (swapIdx < 0 || swapIdx >= sorted.length) return;
+    setTransformRules(reorderRules(transformRules, id, sorted[swapIdx].id));
+  };
+
+  const registerReportResult = (data, label) => {
+    const name = uniqueSourceName(sources, label || 'Отчёт');
+    const source = makeSource({
+      name,
+      type: 'derived',
+      data,
+      columns: columnsFromData(data),
+      meta: { from: 'report' },
+    });
+    setSources((prev) => upsertSource(prev, source));
+    setSuccessMsg(`Результат отчёта сохранён в реестр как «${name}»`);
+  };
+
+  useEffect(() => {
     if (!opsCol || !opsTable?.data?.length) return;
     const uniqueOps = uniqueSorted(opsTable.data.map((r) => r[opsCol]));
     setVirtRules((prev) => {
@@ -462,10 +689,12 @@ export default function App() {
     }
   };
 
-  const persistResult = (finalData, label) => {
+  const persistResult = (finalData, label, { forceRegister = false, toolId } = {}) => {
+    const ruleId = toolId ?? activeRule;
     setResultData(finalData);
     setShowResult(true);
-    if (chainEnabled && activeRule !== 7) {
+    setStep(3);
+    if ((forceRegister || chainEnabled) && ruleId !== 7) {
       const name = uniqueSourceName(sources, label || `${primary?.name || 'Результат'}_ETL`);
       const source = makeSource({
         name,
@@ -473,7 +702,7 @@ export default function App() {
         data: finalData,
         columns: columnsFromData(finalData),
         origin: primary?.name || '',
-        meta: { from: 'etl', ruleId: activeRule },
+        meta: { from: 'etl', ruleId },
       });
       setSources((prev) => upsertSource(prev, source));
       setPrimarySourceId(source.id);
@@ -625,6 +854,10 @@ export default function App() {
       onClick={() => {
         setStep(n);
         if (n !== 3) setShowResult(false);
+        if (n === 4) {
+          setErrorMsg('');
+          setSuccessMsg('');
+        }
       }}
       className={`flex items-center gap-3 p-3 rounded-xl transition-all font-bold ${
         step === n ? 'bg-indigo-600 text-white shadow-md' : 'bg-white text-slate-500 hover:bg-slate-100'
@@ -667,6 +900,7 @@ export default function App() {
           {navBtn(1, 'Источники данных', <Database className="w-4 h-4" />)}
           {navBtn(2, 'Развёртывание субконто', <Layers className="w-4 h-4" />)}
           {navBtn(3, 'Трансформация (ETL)', <Sliders className="w-4 h-4" />)}
+          {navBtn(4, 'Отчёты', <FileBarChart className="w-4 h-4" />)}
         </div>
 
         <div className="flex-grow bg-white rounded-2xl shadow-sm border border-slate-200 p-6 md:p-8 min-h-[600px] w-full overflow-hidden">
@@ -687,7 +921,7 @@ export default function App() {
               <div>
                 <h2 className="text-2xl font-black text-slate-800">Шаг 1. Источники данных</h2>
                 <p className="text-sm text-slate-500 font-medium mt-1">
-                  Загрузите все нужные таблицы один раз. Дальше на шагах 2–3 выбирайте их из реестра — без повторной вставки ссылок.
+                  Загрузите все нужные таблицы один раз и выберите основную. На шагах 2–4 выбор идёт только из реестра — без повторной вставки ссылок.
                 </p>
               </div>
 
@@ -976,6 +1210,19 @@ export default function App() {
                       placeholder="Выберите основную..."
                     />
                   </div>
+
+                  <RulesRegistry
+                    rules={transformRules}
+                    sources={sources}
+                    onToggle={(id) => setTransformRules((prev) => toggleRule(prev, id))}
+                    onMove={moveRule}
+                    onEdit={applyRuleToForm}
+                    onRun={runSavedRule}
+                    onCopy={(rule) =>
+                      setTransformRules((prev) => [...prev, duplicateRule(rule, prev)])
+                    }
+                    onDelete={(id) => setTransformRules((prev) => removeRule(prev, id))}
+                  />
 
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
                     {RULES.map((rule) => (
@@ -1552,15 +1799,44 @@ export default function App() {
                   </div>
 
                   {activeRule && (
-                    <div className="mt-8 pt-6 border-t border-slate-200 flex justify-end">
-                      <button type="button" onClick={executeMapping} className="bg-indigo-600 text-white px-8 py-3.5 rounded-xl font-bold hover:bg-indigo-700 transition shadow-lg shadow-indigo-200 flex items-center gap-2 text-lg w-full md:w-auto justify-center">
-                        Применить правило <ArrowRight className="w-5 h-5" />
-                      </button>
+                    <div className="mt-8 pt-6 border-t border-slate-200 space-y-4">
+                      <div className="flex flex-col md:flex-row gap-3 items-stretch md:items-end">
+                        <div className="flex-1">
+                          <label className="text-xs font-bold text-slate-500 mb-1 block">
+                            Имя правила / шаблона трансформации
+                          </label>
+                          <input
+                            type="text"
+                            value={ruleNameDraft}
+                            onChange={(e) => setRuleNameDraft(e.target.value)}
+                            placeholder={`${RULES.find((r) => r.id === activeRule)?.name || 'Правило'}…`}
+                            className="w-full border border-slate-300 rounded-lg p-2.5 text-sm font-medium"
+                          />
+                        </div>
+                        <button
+                          type="button"
+                          onClick={saveCurrentAsRule}
+                          className="bg-white border-2 border-indigo-200 text-indigo-700 px-5 py-2.5 rounded-xl font-bold hover:bg-indigo-50 transition inline-flex items-center justify-center gap-2"
+                        >
+                          <Save className="w-4 h-4" />
+                          {editingRuleId ? 'Обновить правило' : 'Сохранить как правило'}
+                        </button>
+                      </div>
+                      <div className="flex justify-end">
+                        <button type="button" onClick={executeMapping} className="bg-indigo-600 text-white px-8 py-3.5 rounded-xl font-bold hover:bg-indigo-700 transition shadow-lg shadow-indigo-200 flex items-center gap-2 text-lg w-full md:w-auto justify-center">
+                          Применить правило <ArrowRight className="w-5 h-5" />
+                        </button>
+                      </div>
                     </div>
                   )}
                 </div>
               )}
             </div>
+          )}
+
+          {/* ========== STEP 4: Reports ========== */}
+          {step === 4 && (
+            <ReportsPanel sources={sources} onRegisterResult={registerReportResult} />
           )}
 
           {/* ========== STEP 3 result panel ========== */}
@@ -1625,6 +1901,8 @@ export default function App() {
                   <DataPreview data={resultData} columns={resultColumns} maxRows={50} />
                   <div className="text-center flex flex-wrap justify-center gap-4">
                     <button type="button" onClick={() => { setShowResult(false); setActiveRule(null); }} className="text-indigo-600 font-bold hover:underline text-sm">К библиотеке правил</button>
+                    <button type="button" onClick={() => { saveCurrentAsRule(); setShowResult(false); }} className="text-indigo-600 font-bold hover:underline text-sm">Сохранить как правило</button>
+                    <button type="button" onClick={() => setStep(4)} className="text-slate-600 font-bold hover:underline text-sm">К отчётам</button>
                     <button type="button" onClick={() => setStep(1)} className="text-slate-600 font-bold hover:underline text-sm">К реестру источников</button>
                   </div>
                 </>
