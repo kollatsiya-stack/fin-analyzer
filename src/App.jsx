@@ -8,7 +8,6 @@ import {
   Database,
   ExternalLink,
   Filter,
-  FileBarChart,
   Layers,
   RefreshCcw,
   Save,
@@ -25,7 +24,6 @@ import DataPreview from './components/DataPreview.jsx';
 import SourcePicker from './components/SourcePicker.jsx';
 import SourceUploader from './components/SourceUploader.jsx';
 import RulesRegistry from './components/RulesRegistry.jsx';
-import ReportsPanel from './components/ReportsPanel.jsx';
 import { columnsFromData, uniqueSorted } from './lib/parse.js';
 import {
   exportToExcel,
@@ -78,6 +76,11 @@ export default function App() {
   const [step, setStep] = useState(1);
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
+
+  // Reports step removed — clamp any stale step index.
+  useEffect(() => {
+    if (step > 3) setStep(3);
+  }, [step]);
 
   // --- Unified sources registry ---
   const [sources, setSources] = useState([]);
@@ -573,19 +576,6 @@ export default function App() {
     setTransformRules(reorderRules(transformRules, id, sorted[swapIdx].id));
   };
 
-  const registerReportResult = (data, label) => {
-    const name = uniqueSourceName(sources, label || 'Отчёт');
-    const source = makeSource({
-      name,
-      type: 'derived',
-      data,
-      columns: columnsFromData(data),
-      meta: { from: 'report' },
-    });
-    setSources((prev) => upsertSource(prev, source));
-    setSuccessMsg(`Результат отчёта сохранён в реестр как «${name}»`);
-  };
-
   useEffect(() => {
     if (!opsCol || !opsTable?.data?.length) return;
     const uniqueOps = uniqueSorted(opsTable.data.map((r) => r[opsCol]));
@@ -900,7 +890,6 @@ export default function App() {
           {navBtn(1, 'Источники данных', <Database className="w-4 h-4" />)}
           {navBtn(2, 'Развёртывание субконто', <Layers className="w-4 h-4" />)}
           {navBtn(3, 'Трансформация (ETL)', <Sliders className="w-4 h-4" />)}
-          {navBtn(4, 'Отчёты', <FileBarChart className="w-4 h-4" />)}
         </div>
 
         <div className="flex-grow bg-white rounded-2xl shadow-sm border border-slate-200 p-6 md:p-8 min-h-[600px] w-full overflow-hidden">
@@ -1834,11 +1823,6 @@ export default function App() {
             </div>
           )}
 
-          {/* ========== STEP 4: Reports ========== */}
-          {step === 4 && (
-            <ReportsPanel sources={sources} onRegisterResult={registerReportResult} />
-          )}
-
           {/* ========== STEP 3 result panel ========== */}
           {step === 3 && showResult && (
             <div className="space-y-6 py-6">
@@ -1902,7 +1886,6 @@ export default function App() {
                   <div className="text-center flex flex-wrap justify-center gap-4">
                     <button type="button" onClick={() => { setShowResult(false); setActiveRule(null); }} className="text-indigo-600 font-bold hover:underline text-sm">К библиотеке правил</button>
                     <button type="button" onClick={() => { saveCurrentAsRule(); setShowResult(false); }} className="text-indigo-600 font-bold hover:underline text-sm">Сохранить как правило</button>
-                    <button type="button" onClick={() => setStep(4)} className="text-slate-600 font-bold hover:underline text-sm">К отчётам</button>
                     <button type="button" onClick={() => setStep(1)} className="text-slate-600 font-bold hover:underline text-sm">К реестру источников</button>
                   </div>
                 </>
