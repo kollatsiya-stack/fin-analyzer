@@ -43,7 +43,11 @@ import {
   uniqueSourceName,
   upsertSource,
 } from './lib/sources.js';
-import { detectSubcontoColumns, expandSubconto } from './lib/subconto.js';
+import {
+  detectSubcontoColumns,
+  expandSubconto,
+  listSubcontoDictionaries,
+} from './lib/subconto.js';
 
 const RULES = [
   { id: 1, name: 'Обогащение/объединение данных', desc: 'Добавление аналитик, объединение баз, тегирование', icon: Search, color: 'text-blue-600', bg: 'bg-blue-100', border: 'hover:border-blue-300' },
@@ -73,6 +77,8 @@ export default function App() {
   const [postingsId, setPostingsId] = useState(null);
   const [coaId, setCoaId] = useState(null);
   const [subcontoMap, setSubcontoMap] = useState({});
+  const [subcontoSelectedIds, setSubcontoSelectedIds] = useState([]);
+  const [subcontoDictSourceIds, setSubcontoDictSourceIds] = useState({});
   const [subcontoPreview, setSubcontoPreview] = useState(null);
 
   // Step 3 — ETL
@@ -311,14 +317,41 @@ export default function App() {
     if (coaMatrixId === id) setCoaMatrixId(null);
   };
 
-  // Auto-detect subconto columns when tables change
+  const subcontoDictionaries = useMemo(() => {
+    if (!postings || !coaTable) return [];
+    try {
+      return listSubcontoDictionaries({
+        postings: postings.data,
+        coa: coaTable.data,
+        config: subcontoMap,
+      });
+    } catch {
+      return [];
+    }
+  }, [postings, coaTable, subcontoMap]);
+
+  // Auto-detect subconto columns when tables change; refresh dictionary checklist.
   useEffect(() => {
     if (!postings || !coaTable) {
       setSubcontoMap({});
+      setSubcontoSelectedIds([]);
       return;
     }
     setSubcontoMap(detectSubcontoColumns(postings.columns, coaTable.columns));
-  }, [postingsId, coaId, postings, coaTable]);
+  }, [postingsId, coaId]);
+
+  useEffect(() => {
+    if (!subcontoDictionaries.length) {
+      setSubcontoSelectedIds([]);
+      return;
+    }
+    setSubcontoSelectedIds((prev) => {
+      const valid = new Set(subcontoDictionaries.map((d) => d.id));
+      const kept = prev.filter((id) => valid.has(id));
+      // First load / empty selection → select all by default.
+      return kept.length ? kept : subcontoDictionaries.map((d) => d.id);
+    });
+  }, [subcontoDictionaries]);
 
   useEffect(() => {
     if (typeof localStorage === 'undefined') return;
@@ -345,10 +378,15 @@ export default function App() {
         setErrorMsg('Выберите таблицу проводок и план счетов из реестра');
         return;
       }
+      if (!subcontoSelectedIds.length) {
+        setErrorMsg('Отметьте хотя бы один справочник / субконто в списке ниже');
+        return;
+      }
       const result = expandSubconto({
         postings: postings.data,
         coa: coaTable.data,
         config: subcontoMap,
+        selectedIds: subcontoSelectedIds,
       });
       setSubcontoPreview(result);
       if (saveToRegistry) {
@@ -359,15 +397,24 @@ export default function App() {
           data: result.data,
           columns: result.columns,
           origin: postings.name,
-          meta: { from: 'subconto', postingsId, coaId, addedColumns: result.addedColumns },
+          meta: {
+            from: 'subconto',
+            postingsId,
+            coaId,
+            addedColumns: result.addedColumns,
+            selectedIds: result.selectedIds,
+            dictSourceIds: { ...subcontoDictSourceIds },
+          },
         });
         setSources((prev) => upsertSource(prev, source));
         setPrimarySourceId(source.id);
         setPreviewId(source.id);
-        setSuccessMsg(`Сохранено в реестр как «${name}» (${result.data.length} строк, +${result.addedColumns.length} кол.)`);
+        setSuccessMsg(
+          `Сохранено в реестр как «${name}» (${result.data.length} строк, +${result.addedColumns.length} кол., справочников: ${result.selectedIds.length})`
+        );
       } else {
         setSuccessMsg(
-          `Развёрнуто: ${result.data.length} строк, добавлено колонок: ${result.addedColumns.length}`
+          `Развёрнуто: ${result.data.length} строк, колонок: ${result.addedColumns.length} (справочников: ${result.selectedIds.length})`
         );
       }
     } catch (err) {
@@ -784,6 +831,85 @@ export default function App() {
                       </div>
                     ))}
                   </div>
+                </div>
+              )}
+
+              {postings && coaTable && subcontoDictionaries.length > 0 && (
+                <div className="bg-indigo-50 border border-indigo-200 rounded-xl p-4 space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+                    <div>
+                      <h4 className="font-bold text-indigo-900 text-sm">Какие справочники / субконто разворачивать?</h4>
+                      <p className="text-xs text-indigo-800/80 font-medium mt-1">
+                        Отметьте только нужные виды аналитики. Неотмеченные не попадут в результат.
+                        При желании привяжите к виду таблицу-справочник из реестра (для дальнейших шагов).
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => setSubcontoSelectedIds(subcontoDictionaries.map((d) => d.id))}
+                        className="text-xs font-bold px-3 py-1.5 rounded-lg bg-white border border-indigo-200 text-indigo-700 hover:bg-indigo-100"
+                      >
+                        Выбрать все
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSubcontoSelectedIds([])}
+                        className="text-xs font-bold px-3 py-1.5 rounded-lg bg-white border border-indigo-200 text-indigo-700 hover:bg-indigo-100"
+                      >
+                        Снять все
+                      </button>
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    {subcontoDictionaries.map((dict) => {
+                      const checked = subcontoSelectedIds.includes(dict.id);
+                      return (
+                        <div
+                          key={dict.id}
+                          className={`bg-white border rounded-xl p-3 flex flex-col lg:flex-row lg:items-center gap-3 ${
+                            checked ? 'border-indigo-300' : 'border-slate-200 opacity-70'
+                          }`}
+                        >
+                          <label className="flex items-start gap-3 flex-1 cursor-pointer min-w-0">
+                            <input
+                              type="checkbox"
+                              className="mt-1 accent-indigo-600 w-4 h-4"
+                              checked={checked}
+                              onChange={(e) => {
+                                setSubcontoSelectedIds((prev) =>
+                                  e.target.checked
+                                    ? [...prev, dict.id]
+                                    : prev.filter((id) => id !== dict.id)
+                                );
+                              }}
+                            />
+                            <span className="min-w-0">
+                              <span className="font-bold text-slate-800 text-sm block">{dict.label}</span>
+                              <span className="text-xs text-slate-500 font-medium">{dict.description}</span>
+                            </span>
+                          </label>
+                          {checked && dict.kind === 'type' && (
+                            <div className="w-full lg:w-80">
+                              <SourcePicker
+                                sources={sources}
+                                value={subcontoDictSourceIds[dict.id] || null}
+                                onChange={(id) =>
+                                  setSubcontoDictSourceIds((prev) => ({ ...prev, [dict.id]: id }))
+                                }
+                                label="Справочник из реестра (необязательно)"
+                                placeholder="Не привязан"
+                                excludeIds={[postingsId, coaId].filter(Boolean)}
+                              />
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <p className="text-xs font-bold text-indigo-800">
+                    Выбрано: {subcontoSelectedIds.length} из {subcontoDictionaries.length}
+                  </p>
                 </div>
               )}
 

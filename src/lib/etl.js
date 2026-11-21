@@ -506,4 +506,8 @@ export { columnsFromData };
 
 // Subconto expansion lives in its own module; re-exported here so ETL callers
 // can import join/allocation/subconto from one place.
-export { expandSubconto, detectSubcontoColumns } from './subconto.js';
+export {
+  expandSubconto,
+  detectSubcontoColumns,
+  listSubcontoDictionaries,
+} from './subconto.js';

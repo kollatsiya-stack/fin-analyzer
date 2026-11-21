@@ -151,6 +151,178 @@ function divisionColName(side) {
   return side === 'ct' ? 'Подразделение Кт' : 'Подразделение Дт';
 }
 
+function resolveMapping(postings, coa, config = {}) {
+  const postColumns = columnsFromData(postings);
+  const coaColumns = columnsFromData(coa);
+  return applyPositionalFallback(
+    { ...detectSubcontoColumns(postColumns, coaColumns), ...config },
+    postColumns
+  );
+}
+
+function typeDictId(typeName) {
+  return `type:${norm(typeName)}`;
+}
+
+function divisionDictId(side) {
+  return `div:${side}`;
+}
+
+function slotDictId(side, slotIndex) {
+  return `slot:${side}:${slotIndex + 1}`;
+}
+
+/**
+ * List справочники / analytics the user can choose to expand.
+ * Preference order: named COA types → positional slots → divisions.
+ *
+ * @returns {{ id: string, kind: 'type'|'slot'|'division', label: string, typeName?: string, side?: string, slot?: number, sides: string[], description: string }[]}
+ */
+export function listSubcontoDictionaries({ postings, coa, config = {} }) {
+  if (!postings?.length || !coa?.length) return [];
+  const detected = resolveMapping(postings, coa, config);
+  if (!detected.coaAccount) return [];
+
+  const { resolveTypes } = buildCoaIndex(coa, {
+    accountCol: detected.coaAccount,
+    parentCol: detected.coaParent,
+    typeCols: [detected.coaType1, detected.coaType2, detected.coaType3],
+  });
+
+  const subDt = [detected.postSubDt1, detected.postSubDt2, detected.postSubDt3];
+  const subCt = [detected.postSubCt1, detected.postSubCt2, detected.postSubCt3];
+
+  /** @type {Map<string, { id: string, kind: string, label: string, typeName?: string, sides: Set<string>, slots: Set<string>, description: string }>} */
+  const byId = new Map();
+
+  const noteType = (side, slotIndex, typeName) => {
+    const clean = String(typeName || '').trim();
+    if (clean) {
+      const id = typeDictId(clean);
+      if (!byId.has(id)) {
+        byId.set(id, {
+          id,
+          kind: 'type',
+          label: clean,
+          typeName: clean,
+          sides: new Set(),
+          slots: new Set(),
+          description: '',
+        });
+      }
+      const entry = byId.get(id);
+      entry.sides.add(side);
+      entry.slots.add(`${sidePrefix(side)} · позиция ${slotIndex + 1}`);
+      return;
+    }
+    // Unnamed type → positional fallback option.
+    const id = slotDictId(side, slotIndex);
+    if (!byId.has(id)) {
+      byId.set(id, {
+        id,
+        kind: 'slot',
+        label: `Субконто ${slotIndex + 1} (${sidePrefix(side)})`,
+        side,
+        slot: slotIndex + 1,
+        sides: new Set([side]),
+        slots: new Set(),
+        description: `Позиция ${slotIndex + 1} без вида в плане счетов`,
+      });
+    }
+  };
+
+  const scanAccounts = (side, accountCol, subCols) => {
+    if (!accountCol) return;
+    const seenAccounts = new Set();
+    for (const row of postings) {
+      const code = normalizeAccountCode(row[accountCol]);
+      if (!code || seenAccounts.has(code)) continue;
+      seenAccounts.add(code);
+      const types = resolveTypes(code);
+      for (let i = 0; i < 3; i += 1) {
+        if (!subCols[i]) continue;
+        noteType(side, i, types[i]);
+      }
+    }
+  };
+
+  scanAccounts('dt', detected.postAccountDt, subDt);
+  scanAccounts('ct', detected.postAccountCt, subCt);
+
+  // Also harvest types directly from COA rows (covers types not present in sample postings).
+  for (const row of coa) {
+    for (const col of [detected.coaType1, detected.coaType2, detected.coaType3]) {
+      if (!col) continue;
+      const clean = cellText(row, col);
+      if (!clean) continue;
+      const id = typeDictId(clean);
+      if (!byId.has(id)) {
+        byId.set(id, {
+          id,
+          kind: 'type',
+          label: clean,
+          typeName: clean,
+          sides: new Set(),
+          slots: new Set(),
+          description: 'Вид из плана счетов',
+        });
+      }
+    }
+  }
+
+  if (detected.postDivDt) {
+    byId.set(divisionDictId('dt'), {
+      id: divisionDictId('dt'),
+      kind: 'division',
+      label: 'Подразделение Дт',
+      side: 'dt',
+      sides: new Set(['dt']),
+      slots: new Set(),
+      description: 'Аналитика подразделения по дебету',
+    });
+  }
+  if (detected.postDivCt) {
+    byId.set(divisionDictId('ct'), {
+      id: divisionDictId('ct'),
+      kind: 'division',
+      label: 'Подразделение Кт',
+      side: 'ct',
+      sides: new Set(['ct']),
+      slots: new Set(),
+      description: 'Аналитика подразделения по кредиту',
+    });
+  }
+
+  return Array.from(byId.values())
+    .map((entry) => {
+      const sides = Array.from(entry.sides);
+      const slots = Array.from(entry.slots);
+      let description = entry.description || '';
+      if (entry.kind === 'type') {
+        const sideLabel = sides.length
+          ? sides.map((s) => sidePrefix(s)).join(' / ')
+          : 'Дт / Кт';
+        description = slots.length
+          ? `Справочник · ${sideLabel} (${slots.join(', ')})`
+          : `Справочник · ${sideLabel}`;
+      }
+      return {
+        id: entry.id,
+        kind: entry.kind,
+        label: entry.label,
+        typeName: entry.typeName,
+        side: entry.side,
+        slot: entry.slot,
+        sides,
+        description,
+      };
+    })
+    .sort((a, b) => {
+      const order = { type: 0, slot: 1, division: 2 };
+      return (order[a.kind] ?? 9) - (order[b.kind] ?? 9) || a.label.localeCompare(b.label, 'ru');
+    });
+}
+
 /**
  * Expand postings subconto into named analytics columns.
  *
@@ -158,18 +330,15 @@ function divisionColName(side) {
  * @param {object[]} args.postings
  * @param {object[]} args.coa
  * @param {object} [args.config] column mapping (partial OK — rest auto-detected)
- * @returns {{ data: object[], columns: string[], mapping: object, addedColumns: string[] }}
+ * @param {string[]|null} [args.selectedIds] dictionary ids from listSubcontoDictionaries;
+ *   `null`/`undefined` = all; `[]` = none (no analytics columns added)
+ * @returns {{ data: object[], columns: string[], mapping: object, addedColumns: string[], selectedIds: string[] }}
  */
-export function expandSubconto({ postings, coa, config = {} }) {
+export function expandSubconto({ postings, coa, config = {}, selectedIds = null }) {
   if (!postings?.length) throw new Error('Нет строк в таблице проводок');
   if (!coa?.length) throw new Error('Нет строк в плане счетов');
 
-  const postColumns = columnsFromData(postings);
-  const coaColumns = columnsFromData(coa);
-  const detected = applyPositionalFallback(
-    { ...detectSubcontoColumns(postColumns, coaColumns), ...config },
-    postColumns
-  );
+  const detected = resolveMapping(postings, coa, config);
 
   const accountDt = detected.postAccountDt;
   const accountCt = detected.postAccountCt;
@@ -184,6 +353,26 @@ export function expandSubconto({ postings, coa, config = {} }) {
     );
   }
 
+  const dictionaries = listSubcontoDictionaries({ postings, coa, config: detected });
+  const allIds = dictionaries.map((d) => d.id);
+  const activeIds = selectedIds == null ? allIds : selectedIds.filter((id) => allIds.includes(id));
+  const active = new Set(activeIds);
+
+  if (selectedIds != null && active.size === 0) {
+    throw new Error('Выберите хотя бы один справочник / субконто для развёртывания');
+  }
+
+  const allowedTypeNames = new Set(
+    dictionaries.filter((d) => d.kind === 'type' && active.has(d.id)).map((d) => norm(d.typeName))
+  );
+  const allowedSlots = new Set(
+    dictionaries
+      .filter((d) => d.kind === 'slot' && active.has(d.id))
+      .map((d) => `${d.side}:${d.slot}`)
+  );
+  const allowDivDt = active.has(divisionDictId('dt'));
+  const allowDivCt = active.has(divisionDictId('ct'));
+
   const { resolveTypes } = buildCoaIndex(coa, {
     accountCol: detected.coaAccount,
     parentCol: detected.coaParent,
@@ -193,34 +382,41 @@ export function expandSubconto({ postings, coa, config = {} }) {
   const subDt = [detected.postSubDt1, detected.postSubDt2, detected.postSubDt3];
   const subCt = [detected.postSubCt1, detected.postSubCt2, detected.postSubCt3];
 
+  const slotAllowed = (side, slotIndex, typeName) => {
+    const clean = String(typeName || '').trim();
+    if (clean) return allowedTypeNames.has(norm(clean));
+    return allowedSlots.has(`${side}:${slotIndex + 1}`);
+  };
+
   const addedSet = new Set();
   const data = postings.map((row) => {
     const out = { ...row };
 
-    const applySide = (side, accountCol, subCols, divCol) => {
+    const applySide = (side, accountCol, subCols, divCol, allowDiv) => {
       if (!accountCol) return;
       const types = resolveTypes(row[accountCol]);
       for (let i = 0; i < 3; i += 1) {
         const srcCol = subCols[i];
         if (!srcCol) continue;
-        const typeName = types[i] || `Субконто ${i + 1}`;
-        const dest = analyticsColName(side, typeName);
+        const typeName = types[i] || '';
+        if (!slotAllowed(side, i, typeName)) continue;
+        const dest = analyticsColName(side, typeName || `Субконто ${i + 1}`);
         out[dest] = row[srcCol] ?? '';
         addedSet.add(dest);
       }
-      if (divCol) {
+      if (divCol && allowDiv) {
         const dest = divisionColName(side);
         out[dest] = row[divCol] ?? '';
         addedSet.add(dest);
       }
     };
 
-    applySide('dt', accountDt, subDt, detected.postDivDt);
-    applySide('ct', accountCt, subCt, detected.postDivCt);
+    applySide('dt', accountDt, subDt, detected.postDivDt, allowDivDt);
+    applySide('ct', accountCt, subCt, detected.postDivCt, allowDivCt);
     return out;
   });
 
   const addedColumns = Array.from(addedSet);
   const columns = columnsFromData(data);
-  return { data, columns, mapping: detected, addedColumns };
+  return { data, columns, mapping: detected, addedColumns, selectedIds: activeIds };
 }
