@@ -96,3 +96,79 @@ export function compositeKey(row, fields) {
 export function roundMoney(n) {
   return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 }
+
+/** Excel serial → YYYY-MM-DD via UTC calendar (no local TZ shift). */
+function excelSerialToKey(serial) {
+  const n = Math.floor(Number(serial));
+  if (!Number.isFinite(n)) return null;
+  // Reasonable Excel day range ~1900–2100
+  if (n < 1 || n > 80000) return null;
+  const epoch = Date.UTC(1899, 11, 30) + n * 86400000;
+  const dt = new Date(epoch);
+  const y = dt.getUTCFullYear();
+  const m = String(dt.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(dt.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function ymdKey(y, m, d) {
+  const yi = Number(y);
+  const mi = Number(m);
+  const di = Number(d);
+  if (!Number.isFinite(yi) || !Number.isFinite(mi) || !Number.isFinite(di)) return null;
+  if (mi < 1 || mi > 12 || di < 1 || di > 31) return null;
+  return `${String(yi).padStart(4, '0')}-${String(mi).padStart(2, '0')}-${String(di).padStart(2, '0')}`;
+}
+
+/**
+ * Parse date-like values to YYYY-MM-DD (calendar day, no TZ drift).
+ * Supports Date, Excel serial (number or digit string), ISO, DD.MM.YYYY[, HH:mm[:ss]].
+ * Does not use ambiguous `new Date(string)` parsing (avoids UTC/local shifts and
+ * bogus years like `new Date('44927')` → 44927-01-01).
+ */
+export function toDateKey(raw) {
+  if (raw == null || raw === '') return null;
+
+  if (raw instanceof Date && !Number.isNaN(raw.getTime())) {
+    // Excel/SheetJS often gives UTC midnight; use UTC Y-M-D when time is UTC midnight
+    // to avoid previous-day shift in western timezones. Otherwise use local calendar.
+    const utcMidnight =
+      raw.getUTCHours() === 0 &&
+      raw.getUTCMinutes() === 0 &&
+      raw.getUTCSeconds() === 0 &&
+      raw.getUTCMilliseconds() === 0;
+    if (utcMidnight) {
+      return ymdKey(raw.getUTCFullYear(), raw.getUTCMonth() + 1, raw.getUTCDate());
+    }
+    return ymdKey(raw.getFullYear(), raw.getMonth() + 1, raw.getDate());
+  }
+
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    return excelSerialToKey(raw);
+  }
+
+  const s = String(raw).trim();
+  if (!s) return null;
+
+  // Pure numeric string → Excel serial (not a year)
+  if (/^\d{4,6}(?:\.\d+)?$/.test(s)) {
+    const asSerial = excelSerialToKey(s);
+    if (asSerial) return asSerial;
+  }
+
+  // ISO / YYYY-MM-DD[ T/ ]HH:mm:ss[.sss][Z|±offset]
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return ymdKey(iso[1], iso[2], iso[3]);
+
+  // DD.MM.YYYY or DD/MM/YYYY[, HH:mm[:ss]]
+  const dmy = s.match(
+    /^(\d{1,2})[./](\d{1,2})[./](\d{2,4})(?:[ T]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?)?$/
+  );
+  if (dmy) {
+    const y = dmy[3].length === 2 ? `20${dmy[3]}` : dmy[3];
+    return ymdKey(y, dmy[2], dmy[1]);
+  }
+
+  // Reject everything else — do not fall back to Date.parse (TZ / garbage years).
+  return null;
+}
